@@ -1,21 +1,11 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.10.2)
 
-project("droiddesk_compositor")
+project(termux)
 
-# Add the native JNI bridge source
-add_library(
-    droiddesk_compositor
-    SHARED
-    compositor_jni.cpp
+add_library(termux SHARED
+    termux.c
 )
 
-# Search for standard Android libraries
-find_library(log-lib log)
-find_library(android-lib android)
-
-# Link the libraries
-target_link_libraries(
-    droiddesk_compositor
-    ${log-lib}
-    ${android-lib}
+target_link_libraries(termux
+    log
 )

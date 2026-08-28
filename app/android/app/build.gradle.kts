@@ -8,7 +8,7 @@ plugins {
 android {
     namespace = "com.orailnoor.droiddesk"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "27.0.12077973"
 
     buildFeatures {
         aidl = true

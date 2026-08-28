@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Terminal</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; background:#0a0a0a; overflow:hidden; font-family:'Cascadia Mono','Fira Code','JetBrains Mono',monospace; }
+#terminal { position:absolute; top:0; left:0; right:0; bottom:84px; padding:10px; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+#terminal pre { font-size:14px; color:#e0e0e0; line-height:1.5; white-space:pre-wrap; word-break:break-all; }
+#terminal .prompt { color:#00e676; }
+#terminal .cmd { color:#e0e0e0; }
+#terminal .err { color:#ff5252; }
+#terminal .info { color:#4fc3f7; }
+#terminal .warn { color:#ffb74d; }
+#input-bar { position:fixed; bottom:0; left:0; right:0; background:#0d0d0d; border-top:1px solid #333; padding:12px 12px 16px; }
+#input-line { display:flex; align-items:center; min-height:48px; background:#161616; border-radius:8px; padding:0 12px; border:1px solid #2a2a2a; }
+#input-line .ps { color:#00e676; font-size:16px; margin-right:8px; user-select:none; }
+#input { flex:1; background:transparent; border:none; outline:none; color:#e0e0e0; font-size:16px; caret-color:#00e676; min-height:48px; font-family:inherit; }
+#input::placeholder { color:#555; }
+#send-btn { background:#008578; color:#fff; border:none; border-radius:8px; padding:0 18px; margin-left:8px; height:48px; font-size:16px; font-weight:bold; cursor:pointer; user-select:none; }
+#send-btn:active { background:#00695c; }
+#ctrl-bar { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+#ctrl-bar button { background:#222; color:#ccc; border:1px solid #333; border-radius:6px; padding:8px 14px; font-size:13px; font-family:inherit; cursor:pointer; user-select:none; }
+#ctrl-bar button:active { background:#333; }
+#ctrl-bar button.danger { color:#ff5252; border-color:#5a1a1a; }
+</style>
+</head>
+<body>
+<div id="terminal"><pre id="output"></pre></div>
+<div id="input-bar">
+  <div id="ctrl-bar">
+    <button id="btn-ctrlc">Ctrl+C</button>
+    <button id="btn-ctrlz">Ctrl+Z</button>
+    <button id="btn-tab">Tab</button>
+    <button id="btn-arrow-up">↑ Hist</button>
+    <button id="btn-arrow-down">↓ Hist</button>
+    <button id="btn-ssh" style="color:#4fc3f7;border-color:#1a3a5a;">SSH</button>
+    <button id="btn-clear" style="color:#ffb74d;border-color:#5a4a1a;">Clear</button>
+    <button id="btn-exit" class="danger">Exit</button>
+  </div>
+  <div id="input-line">
+    <span class="ps" id="prompt-sign">$&nbsp;</span>
+    <input id="input" type="text" placeholder="Enter command..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button id="send-btn">↵</button>
+  </div>
+</div>
+<script>
+var output = document.getElementById('output');
+var input = document.getElementById('input');
+var promptSign = document.getElementById('prompt-sign');
+var sendBtn = document.getElementById('send-btn');
+var history = [];
+var historyIdx = -1;
+var passwordMode = false;
+var sshHost = '';
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function appendOutput(text, cls) {
+  var span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  output.appendChild(span);
+  output.appendChild(document.createTextNode('\n'));
+  scrollToBottom();
+}
+
+function appendHtml(html) {
+  var div = document.createElement('div');
+  div.innerHTML = html;
+  while (div.firstChild) output.appendChild(div.firstChild);
+  output.appendChild(document.createTextNode('\n'));
+  scrollToBottom();
+}
+
+function scrollToBottom() {
+  var term = document.getElementById('terminal');
+  term.scrollTop = term.scrollHeight;
+}
+
+function sendCommand() {
+  var cmd = input.value;
+  if (passwordMode) {
+    appendOutput('[password]', 'info');
+    input.value = '';
+    passwordMode = false;
+    promptSign.textContent = '$ ';
+    input.type = 'text';
+    input.setAttribute('placeholder','Enter command...');
+    if (window.Android && window.Android.sendPassword) {
+      window.Android.sendPassword(cmd);
+    }
+    return;
+  }
+  if (cmd.trim()) {
+    history.push(cmd);
+    historyIdx = history.length;
+  }
+  appendHtml('<span class="prompt">$ </span><span class="cmd">' + escapeHtml(cmd) + '</span>');
+  input.value = '';
+  if (window.Android && window.Android.executeCommand) {
+    window.Android.executeCommand(cmd);
+  }
+}
+
+function enterPasswordMode() {
+  passwordMode = true;
+  input.type = 'password';
+  input.value = '';
+  promptSign.textContent = '🔒 ';
+  input.setAttribute('placeholder','Enter password (hidden)...');
+  input.focus();
+}
+
+function leavePasswordMode() {
+  passwordMode = false;
+  input.type = 'text';
+  input.value = '';
+  promptSign.textContent = '$ ';
+  input.setAttribute('placeholder','Enter command...');
+}
+
+// Enter sends
+input.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    sendCommand();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (historyIdx > 0) { historyIdx--; input.value = history[historyIdx]; }
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (historyIdx < history.length - 1) { historyIdx++; input.value = history[historyIdx]; }
+    else { historyIdx = history.length; input.value = ''; }
+  } else if (e.key === 'Tab') {
+    e.preventDefault();
+    if (window.Android && window.Android.sendSpecial) window.Android.sendSpecial('tab');
+  }
+});
+
+sendBtn.addEventListener('click', sendCommand);
+
+document.getElementById('btn-ctrlc').addEventListener('click', function() {
+  if (window.Android && window.Android.sendSpecial) window.Android.sendSpecial('ctrlc');
+  appendOutput('^C', 'err');
+});
+
+document.getElementById('btn-ctrlz').addEventListener('click', function() {
+  if (window.Android && window.Android.sendSpecial) window.Android.sendSpecial('ctrlz');
+  appendOutput('^Z', 'warn');
+});
+
+document.getElementById('btn-tab').addEventListener('click', function() {
+  if (window.Android && window.Android.sendSpecial) window.Android.sendSpecial('tab');
+});
+
+document.getElementById('btn-arrow-up').addEventListener('click', function() {
+  if (historyIdx > 0) { historyIdx--; input.value = history[historyIdx]; }
+  input.focus();
+});
+
+document.getElementById('btn-arrow-down').addEventListener('click', function() {
+  if (historyIdx < history.length - 1) { historyIdx++; input.value = history[historyIdx]; }
+  else { historyIdx = history.length; input.value = ''; }
+  input.focus();
+});
+
+document.getElementById('btn-clear').addEventListener('click', function() {
+  output.innerHTML = '';
+});
+
+document.getElementById('btn-exit').addEventListener('click', function() {
+  if (window.Android && window.Android.executeCommand) window.Android.executeCommand('exit');
+  setTimeout(function() { if (window.Android && window.Android.closeTerminal) window.Android.closeTerminal(); }, 200);
+});
+
+document.getElementById('btn-ssh').addEventListener('click', function() {
+  var host = prompt('SSH 连接\n格式: user@host 或 user@host:port\n例如: root@192.168.1.100:2222');
+  if (!host) return;
+  sshHost = host;
+  appendOutput('Connecting to ' + escapeHtml(host) + '...', 'info');
+  if (window.Android && window.Android.startSsh) {
+    window.Android.startSsh(host);
+  }
+});
+
+// Called from Android
+function showOutput(text) {
+  var lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i] !== '') appendOutput(lines[i]);
+  }
+  scrollToBottom();
+}
+
+function showError(text) {
+  appendOutput(text, 'err');
+  scrollToBottom();
+}
+
+// Detect password prompt from shell output
+function maybePromptPassword(text) {
+  if (/password\s*:?\s*$/.test(text) || /password\s*for\s/i.test(text)) {
+    enterPasswordMode();
+    return true;
+  }
+  return false;
+}
+
+appendOutput('DroidDesk Native Terminal', 'info');
+appendOutput('Type commands below. Enter to send. Tap SSH to connect.\n');
+input.focus();
+</script>
+</body>
+</html>

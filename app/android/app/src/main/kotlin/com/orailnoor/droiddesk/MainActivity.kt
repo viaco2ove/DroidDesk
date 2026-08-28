@@ -417,6 +417,13 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                // ── Native Terminal ──
+                "launchNativeTerminal" -> {
+                    val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.terminal.NativeTerminalActivity::class.java)
+                    startActivity(intent)
+                    result.success(true)
+                }
+
                 "stopLinux" -> {
                     thread(name = "stop-linux-session") {
                         if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {

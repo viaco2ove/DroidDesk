@@ -4,6 +4,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- 开机自启 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 自定义 RUN_COMMAND 权限 -->
+    <uses-permission android:name="com.orailnoor.droiddesk.permission.RUN_COMMAND" />
+
     <!-- Keep Linux processes alive -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -56,6 +62,15 @@
             android:taskAffinity=""
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
 
+        <!-- Native Terminal Activity -->
+        <activity
+            android:name=".terminal.NativeTerminalActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize" />
+
         <!-- The native X server must have a different Linux process and FD table than LorieView. -->
         <service
             android:name=".x11.X11ServerService"
@@ -69,6 +84,28 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- 自定义 RUN_COMMAND 服务 - 第三方应用可调用执行命令 -->
+        <service
+            android:name=".service.RunCommandService"
+            android:exported="true"
+            android:permission="com.orailnoor.droiddesk.permission.RUN_COMMAND">
+            <intent-filter>
+                <action android:name="com.orailnoor.droiddesk.RUN_COMMAND" />
+            </intent-filter>
+        </service>
+
+        <!-- 开机自启广播接收器 -->
+        <receiver
+            android:name=".boot.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.REBOOT" />
+            </intent-filter>
+        </receiver>
 
         <meta-data
             android:name="flutterEmbedding"

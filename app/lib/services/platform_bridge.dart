@@ -163,6 +163,12 @@ class DroidDeskPlatform {
     await _channel.invokeMethod('interruptCommand');
   }
 
+  // ── Native Terminal ──
+
+  static Future<void> launchNativeTerminal() async {
+    await _channel.invokeMethod('launchNativeTerminal');
+  }
+
   // ── Battery Optimization ──
 
   static Future<void> requestBatteryOptimization() async {

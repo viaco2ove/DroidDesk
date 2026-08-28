@@ -187,6 +187,20 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
 
+                      const SizedBox(height: 10),
+
+                      // ── Terminal Native ──
+                      _ActionCard(
+                        icon: Icons.code_rounded,
+                        title: 'Terminal Native',
+                        subtitle:
+                            'Full-screen native terminal with chroot or Termux shell',
+                        color: const Color(0xFF00BFA5),
+                        onTap: () {
+                          DroidDeskPlatform.launchNativeTerminal();
+                        },
+                      ),
+
                       if (!state.hasRoot &&
                           state.optionalApps['proot_debian'] == true) ...[
                         const SizedBox(height: 10),
