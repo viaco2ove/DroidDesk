@@ -395,7 +395,7 @@ class MainActivity : FlutterActivity() {
                     val creds = mapOf(
                         "user" to (sp.getString("user", "") ?: ""),
                         "password" to (sp.getString("password", "") ?: ""),
-                        "port" to (sp.getString("port", "22") ?: "22"),
+                        "port" to (sp.getString("port", "8122") ?: "8122"),
                     )
                     result.success(creds)
                 }
@@ -403,7 +403,7 @@ class MainActivity : FlutterActivity() {
                 "setUbuntuCredentials" -> {
                     val user = call.argument<String>("user") ?: ""
                     val password = call.argument<String>("password") ?: ""
-                    val port = call.argument<String>("port") ?: "22"
+                    val port = call.argument<String>("port") ?: "8122"
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit()
                         .putString("user", user)

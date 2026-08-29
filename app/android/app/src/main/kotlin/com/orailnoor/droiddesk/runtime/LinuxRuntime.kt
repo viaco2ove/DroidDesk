@@ -1482,8 +1482,8 @@ class LinuxRuntime(private val context: Context) {
         executeCommand("proot-distro $baseArgs mkdir -p /run/sshd")
         // Set port from shared preferences if set
         val sp = context.getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
-        val port = sp.getString("port", "22") ?: "22"
-        if (port.isNotEmpty() && port != "22") {
+        val port = sp.getString("port", "8122") ?: "8122"
+        if (port.isNotEmpty() && port != "8122") {
             executeCommand(
                 "proot-distro $baseArgs sed -i 's/^#\\?Port .*/Port $port/' /etc/ssh/sshd_config"
             )
