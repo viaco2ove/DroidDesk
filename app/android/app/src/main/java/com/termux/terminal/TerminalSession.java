@@ -59,6 +59,11 @@ public final class TerminalSession extends TerminalOutput {
     /** The exit status of the shell process. Only valid if ${@link #mShellPid} is -1. */
     int mShellExitStatus;
 
+    /** Get the shell process exit status. */
+    public int getShellExitStatus() {
+        return mShellExitStatus;
+    }
+
     /**
      * The file descriptor referencing the master half of a pseudo-terminal pair, resulting from calling
      * {@link JNI#createSubprocess(String, String, String[], String[], int[], int, int, int, int)}.

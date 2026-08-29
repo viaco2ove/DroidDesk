@@ -325,6 +325,34 @@ class MainActivity : FlutterActivity() {
 
                 "launchUbuntuTerminal" -> {
                     Log.i(TAG, "launchUbuntuTerminal invoked")
+                    // 把完整的 shell 命令写到文件，绕过执行位问题
+                    if (linuxRuntime.isBootstrapped()) {
+                        val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
+                        cmdFile.parentFile?.mkdirs()
+                        // 不使用 exec，保留 sh 进程以便查看错误
+                        val homeDirPath = "${filesDir.absolutePath}/home"
+                        cmdFile.writeText(
+                            "export PREFIX=\"${linuxRuntime.prefixPath}\"; " +
+                            "export TMPDIR=\"${filesDir.absolutePath}/tmp\"; " +
+                            "export HOME=\"$homeDirPath\"; " +
+                            "export TERMUX_APP__PACKAGE_NAME=\"${packageName}\"; " +
+                            "export TERMUX_APP__DATA_DIR=\"${filesDir.absolutePath}\"; " +
+                            "export TERMUX__PREFIX=\"${linuxRuntime.prefixPath}\"; " +
+                            "export TERMUX__HOME=\"$homeDirPath\"; " +
+                            "export PATH=\"${linuxRuntime.prefixPath}/bin:/system/bin\"; " +
+                            "export PYTHONHOME=\"${linuxRuntime.prefixPath}\"; " +
+                            "export LD_LIBRARY_PATH=\"${linuxRuntime.prefixPath}/lib\"; " +
+                            "mkdir -p \"${filesDir.absolutePath}/tmp/proot\"; " +
+                            "cd \"$homeDirPath\"; " +
+                            "${linuxRuntime.prefixPath}/bin/proot-distro login ubuntu " +
+                            "--bind \"${filesDir.absolutePath}/tmp:/tmp\" " +
+                            "--env PROOT_TMP_DIR=\"${filesDir.absolutePath}/tmp/proot\" " +
+                            "--env PROOT_LOADER=\"${linuxRuntime.prefixPath}/libexec/proot/loader\" " +
+                            "--env PROOT_LOADER_32=\"${linuxRuntime.prefixPath}/libexec/proot/loader32\" " +
+                            "-- /bin/bash --login\n"
+                        )
+                        Log.i(TAG, "Ubuntu cmd file written: ${cmdFile.absolutePath}")
+                    }
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, "Launching Ubuntu terminal...", Toast.LENGTH_SHORT).show()
                     }
