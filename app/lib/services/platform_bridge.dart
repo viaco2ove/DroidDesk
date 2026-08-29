@@ -167,6 +167,26 @@ class DroidDeskPlatform {
     return await _channel.invokeMethod<bool>('uninstallUbuntuSsh') ?? false;
   }
 
+  /// Ubuntu / OpenSSH 运行时状态查询
+  /// 返回值：{ubuntuRunning: bool, sshdRunning: bool, sshPort: int}
+  static Future<Map<String, dynamic>> getUbuntuStatus() async {
+    final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('getUbuntuStatus');
+    final m = raw ?? const {};
+    return {
+      'ubuntuRunning': m['ubuntuRunning'] == true,
+      'sshdRunning': m['sshdRunning'] == true,
+      'sshPort': (m['sshPort'] is num) ? (m['sshPort'] as num).toInt() : 22,
+    };
+  }
+
+  static Future<bool> startUbuntuSshd() async {
+    return await _channel.invokeMethod<bool>('startUbuntuSshd') ?? false;
+  }
+
+  static Future<bool> stopUbuntuSshd() async {
+    return await _channel.invokeMethod<bool>('stopUbuntuSshd') ?? false;
+  }
+
   static Future<bool> installOptionalApp(String appId) async {
     return await _channel.invokeMethod<bool>('installOptionalApp', {
           'appId': appId,

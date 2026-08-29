@@ -26,6 +26,7 @@ class ChrootRuntime(private val context: Context) {
         // DesktopActivity starts the chroot while MainActivity owns status and
         // stop controls, so the process handle must be shared app-wide.
         @Volatile private var sessionProcess: Process? = null
+        @Volatile private var sshdProcess: Process? = null
     }
 
     private val rootShell = RootShell(context)
@@ -327,6 +328,65 @@ class ChrootRuntime(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "uninstallUbuntuSsh failed", e)
             false
+        }
+    }
+
+    // ── 运行时状态探测 ──
+
+    fun isChrootRunning(): Boolean = sessionProcess?.isAlive == true
+
+    fun isSshdRunning(): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        if (sshdProcess?.isAlive == true) return true
+        // 兜底：通过 chroot 内部检测（处理外部启动的 sshd）
+        return try {
+            ensureMounts()
+            val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
+                    "pidof sshd >/dev/null 2>&1 && echo SSHDRUN || echo SSHDEAD"
+            val out = rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}")
+            out.contains("SSHDRUN")
+        } catch (e: Exception) {
+            Log.w(TAG, "isSshdRunning: ${e.message}")
+            false
+        }
+    }
+
+    fun startUbuntuSshd(): Boolean {
+        if (!hasRoot() || !isRootfsReady()) {
+            Log.w(TAG, "startUbuntuSshd: chroot not ready")
+            return false
+        }
+        if (sshdProcess?.isAlive == true) return true
+        stopUbuntuSshd()
+        return try {
+            ensureMounts()
+            val cmd = "sh -c 'mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e'"
+            sshdProcess = ProcessBuilder("chroot", getRootfsPath(), "sh", "-c",
+                "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e")
+                .redirectErrorStream(true)
+                .start()
+            Log.i(TAG, "startUbuntuSshd: started")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startUbuntuSshd failed", e)
+            sshdProcess = null
+            false
+        }
+    }
+
+    fun stopUbuntuSshd() {
+        val p = sshdProcess ?: return
+        try {
+            if (p.isAlive) {
+                p.destroy()
+                if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "stopUbuntuSshd: ${e.message}")
+        } finally {
+            sshdProcess = null
         }
     }
 

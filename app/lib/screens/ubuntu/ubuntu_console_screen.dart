@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/state/app_state.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
+import 'dart:async';
 
 class UbuntuConsoleScreen extends StatefulWidget {
   const UbuntuConsoleScreen({super.key});
@@ -18,6 +19,13 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
   bool _sshInstalled = false;
   bool _loading = true;
 
+  // 运行时状态
+  bool _ubuntuRunning = false;
+  bool _sshdRunning = false;
+  int _sshPort = 22;
+  Timer? _statusTimer;
+  bool _statusBusy = false;
+
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   final _portCtrl = TextEditingController();
@@ -26,14 +34,51 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
   void initState() {
     super.initState();
     _load();
+    _statusTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshStatus());
   }
 
   @override
   void dispose() {
+    _statusTimer?.cancel();
     _userCtrl.dispose();
     _passCtrl.dispose();
     _portCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _refreshStatus() async {
+    if (_statusBusy || !mounted) return;
+    _statusBusy = true;
+    try {
+      final s = await DroidDeskPlatform.getUbuntuStatus();
+      if (!mounted) return;
+      setState(() {
+        _ubuntuRunning = s['ubuntuRunning'] as bool;
+        _sshdRunning = s['sshdRunning'] as bool;
+        _sshPort = s['sshPort'] as int;
+      });
+    } finally {
+      _statusBusy = false;
+    }
+  }
+
+  Future<void> _toggleSshd(bool wantRunning) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = wantRunning
+        ? await DroidDeskPlatform.startUbuntuSshd()
+        : await DroidDeskPlatform.stopUbuntuSshd();
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          ok
+              ? (wantRunning ? 'OpenSSH started' : 'OpenSSH stopped')
+              : (wantRunning ? 'OpenSSH start failed' : 'OpenSSH stop failed'),
+        ),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
   }
 
   Future<void> _load() async {
@@ -54,6 +99,8 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+    // 初始加载时立即刷新运行时状态（timer 会继续周期性刷新）
+    _refreshStatus();
   }
 
   Future<void> _toggle(String key, bool value) async {
@@ -165,6 +212,19 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
                       // 立即跳转，不 await；让原生侧异步启动 terminal activity
                       DroidDeskPlatform.launchUbuntuTerminal();
                     },
+                  ),
+
+const SizedBox(height: 16),
+
+                  // 运行时状态
+                  _RuntimeStatusCard(
+                    ubuntuRunning: _ubuntuRunning,
+                    sshdRunning: _sshdRunning,
+                    sshInstalled: _sshInstalled,
+                    sshPort: _sshPort,
+                    onStartSsh: _sshInstalled ? () => _toggleSshd(true) : null,
+                    onStopSsh: _sshInstalled ? () => _toggleSshd(false) : null,
+                    onRefresh: _refreshStatus,
                   ),
 
                   const SizedBox(height: 16),
@@ -401,6 +461,166 @@ class _SettingCard extends StatelessWidget {
         border: Border.all(color: DroidTheme.surfaceBorder),
       ),
       child: Column(children: children),
+    );
+  }
+}
+
+class _RuntimeStatusCard extends StatelessWidget {
+  final bool ubuntuRunning;
+  final bool sshdRunning;
+  final bool sshInstalled;
+  final int sshPort;
+  final VoidCallback? onStartSsh;
+  final VoidCallback? onStopSsh;
+  final VoidCallback onRefresh;
+  const _RuntimeStatusCard({
+    required this.ubuntuRunning,
+    required this.sshdRunning,
+    required this.sshInstalled,
+    required this.sshPort,
+    required this.onStartSsh,
+    required this.onStopSsh,
+    required this.onRefresh,
+  });
+
+  Widget _row(String label, bool running, String detail, {Color? accent}) {
+    final color = running ? DroidTheme.success : DroidTheme.textDim;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+              boxShadow: running
+                  ? [
+                      BoxShadow(
+                          color: color.withValues(alpha: 0.5),
+                          blurRadius: 6)
+                    ]
+                  : null,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: DroidTheme.bodyMd),
+                Text(detail,
+                    style: DroidTheme.bodySm
+                        ?.copyWith(color: DroidTheme.textSecondary)),
+              ],
+            ),
+          ),
+          Text(running ? 'running' : 'stopped',
+              style: DroidTheme.bodySm?.copyWith(
+                color: color,
+                fontWeight: FontWeight.w600,
+              )),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: DroidTheme.cardBg,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: DroidTheme.surfaceBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('RUNTIME STATUS', style: DroidTheme.label),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.refresh_rounded, size: 20),
+                tooltip: 'Refresh',
+                onPressed: onRefresh,
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          _row(
+            'Ubuntu',
+            ubuntuRunning,
+            ubuntuRunning
+                ? 'proot session alive'
+                : 'not running — open Ubuntu Shell to start',
+          ),
+          const Divider(height: 12, color: DroidTheme.surfaceBorder),
+          _row(
+            'OpenSSH server',
+            sshdRunning,
+            !sshInstalled
+                ? 'not installed — install from openssh section below'
+                : sshdRunning
+                    ? 'listening on 0.0.0.0:$sshPort'
+                    : 'stopped',
+          ),
+          if (sshInstalled && sshdRunning) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: DroidTheme.success.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                    color: DroidTheme.success.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.link_rounded,
+                      color: DroidTheme.success, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'ssh root@<device-ip> -p $sshPort',
+                      style: DroidTheme.bodySm?.copyWith(
+                        fontFamily: 'monospace',
+                        color: DroidTheme.success,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              if (sshInstalled && !sshdRunning)
+                FilledButton.icon(
+                  onPressed: onStartSsh,
+                  style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFFE95420)),
+                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                  label: const Text('Start SSH'),
+                ),
+              if (sshInstalled && sshdRunning)
+                OutlinedButton.icon(
+                  onPressed: onStopSsh,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: DroidTheme.error,
+                    side: BorderSide(color: DroidTheme.error),
+                  ),
+                  icon: const Icon(Icons.stop_rounded, size: 18),
+                  label: const Text('Stop SSH'),
+                ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

@@ -458,6 +458,45 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "getUbuntuStatus" -> {
+                    val status = if (chrootRuntime.hasRoot()) {
+                        mapOf(
+                            "ubuntuRunning" to chrootRuntime.isChrootRunning(),
+                            "sshdRunning" to chrootRuntime.isSshdRunning(),
+                            "sshPort" to getSshPortFromPrefs(),
+                        )
+                    } else {
+                        mapOf(
+                            "ubuntuRunning" to linuxRuntime.isUbuntuProotRunning(),
+                            "sshdRunning" to linuxRuntime.isUbuntuSshdRunning(),
+                            "sshPort" to getSshPortFromPrefs(),
+                        )
+                    }
+                    result.success(status)
+                }
+
+                "startUbuntuSshd" -> {
+                    thread {
+                        val ok = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.startUbuntuSshd()
+                        } else {
+                            linuxRuntime.startUbuntuSshd()
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "stopUbuntuSshd" -> {
+                    thread {
+                        if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.stopUbuntuSshd()
+                        } else {
+                            linuxRuntime.stopUbuntuSshd()
+                        }
+                        runOnUiThread { result.success(true) }
+                    }
+                }
+
                 "installOptionalApp" -> {
                     val appId = call.argument<String>("appId") ?: ""
                     thread {
@@ -650,6 +689,25 @@ class MainActivity : FlutterActivity() {
         // persist the flag and let the launcher query it.
         val sshWithUbuntu = sp.getBoolean("sshWithUbuntu", false)
         Log.i(TAG, "Ubuntu settings applied; sshWithUbuntu=$sshWithUbuntu")
+        // 同步重启 sshd 以反映开关
+        thread(name = "ubuntu-settings-apply") {
+            try {
+                if (sshWithUbuntu) {
+                    if (chrootRuntime.hasRoot()) chrootRuntime.startUbuntuSshd()
+                    else linuxRuntime.startUbuntuSshd()
+                } else {
+                    if (chrootRuntime.hasRoot()) chrootRuntime.stopUbuntuSshd()
+                    else linuxRuntime.stopUbuntuSshd()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "apply sshd state: ${e.message}")
+            }
+        }
+    }
+
+    private fun getSshPortFromPrefs(): Int {
+        val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+        return sp.getString("port", "22")?.toIntOrNull() ?: 22
     }
 
     private fun applyUbuntuCredentials(user: String, password: String, port: String) {

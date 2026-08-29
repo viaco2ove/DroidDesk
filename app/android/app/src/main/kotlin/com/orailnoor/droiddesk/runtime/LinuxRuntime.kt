@@ -68,6 +68,10 @@ class LinuxRuntime(private val context: Context) {
         // wrappers operate on the same session.
         @Volatile private var sessionProcess: Process? = null
         @Volatile private var dbusProcess: Process? = null
+
+        // 独立的 sshd 长期会话（在 Ubuntu 内部运行 sshd 直到显式 stop）。
+        // 与桌面 session 分开，避免争夺 sessionProcess。
+        @Volatile private var sshdProcess: Process? = null
     }
 
     @Volatile private var activeCommandProcess: Process? = null
@@ -1513,6 +1517,108 @@ class LinuxRuntime(private val context: Context) {
             false
         }
     }
+
+    // ── 运行时状态探测 ──
+
+    /**
+     * proot Ubuntu 是否正在运行：存在至少一个 sh/proot bash 子进程；
+     * 同时也用于检测是否处于"常驻 shell 模式"。
+     */
+    fun isUbuntuProotRunning(): Boolean {
+        if (!isProotDistroInstalled("ubuntu")) return false
+        return try {
+            // 直接在 host 执行 ps，绕开终端会话路由（executeCommand 会被终端劫持返回空）
+            val process = Runtime.getRuntime().exec(arrayOf("ps", "-A"))
+            val out = process.inputStream.bufferedReader().use { it.readText() }
+            val alive = out.contains("proot-distro") || out.contains("/bin/bash --login")
+            Log.d(TAG, "isUbuntuProotRunning: $alive")
+            alive
+        } catch (e: Exception) {
+            Log.w(TAG, "isUbuntuProotRunning failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Ubuntu 内部 sshd 是否运行中：通过 /proc/net/tcp 检测端口 LISTEN 状态。
+     * proot 沙箱内的 sshd 监听端口会反映在宿主 net 表中。
+     * sshdProcess 存在且存活时优先用它判断。
+     */
+    fun isUbuntuSshdRunning(): Boolean {
+        if (!isUbuntuSshInstalled()) return false
+        if (sshdProcess?.isAlive == true) return true
+        return try {
+            val portHex = 0x1FBA // sshPort 8122
+            val procNetTcp = java.io.File("/proc/net/tcp")
+            val alive = procNetTcp.readLines().any { line ->
+                val parts = line.split(Regex("\\s+"))
+                parts.size >= 4 && parts[3].equals("0A", ignoreCase = true) &&
+                    parts[1].startsWith("00000000:") &&
+                    parts[1].substringAfter(":").toLong(16) == portHex.toLong()
+            }
+            Log.d(TAG, "isUbuntuSshdRunning (port 8122): $alive")
+            alive
+        } catch (e: Exception) {
+            Log.w(TAG, "isUbuntuSshdRunning failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 启动独立的 sshd 长期会话。sshd 通过 proot-distro 在 Ubuntu 内部前台运行，
+     * proot 的 --kill-on-exit 在 sshd 退出时再回收整个会话。
+     * 若 sshd 已在运行则幂等返回 true。
+     */
+    fun startUbuntuSshd(): Boolean {
+        if (!isUbuntuSshInstalled()) {
+            Log.w(TAG, "startUbuntuSshd: sshd not installed")
+            return false
+        }
+        if (sshdProcess?.isAlive == true) {
+            Log.i(TAG, "startUbuntuSshd: already running")
+            return true
+        }
+        // 先停掉任何游离的 sshd，避免重复监听同一端口
+        stopUbuntuSshd()
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            val innerCmd = "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"
+            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
+            Log.i(TAG, "startUbuntuSshd: $fullCmd")
+            sshdProcess = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .start()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startUbuntuSshd failed", e)
+            sshdProcess = null
+            false
+        }
+    }
+
+    fun stopUbuntuSshd() {
+        val p = sshdProcess ?: return
+        try {
+            if (p.isAlive) {
+                p.destroy()
+                if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "stopUbuntuSshd: ${e.message}")
+        } finally {
+            sshdProcess = null
+        }
+    }
+
+    fun isUbuntuSshdManaged(): Boolean = sshdProcess?.isAlive == true
 
     fun installOptionalApp(
         appId: String,
