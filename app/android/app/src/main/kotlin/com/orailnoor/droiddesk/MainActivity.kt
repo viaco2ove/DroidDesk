@@ -33,7 +33,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        linuxRuntime = LinuxRuntime(this)
+        linuxRuntime = LinuxRuntime.getInstance(this)
         chrootRuntime = ChrootRuntime(this)
 
         if (intent.getBooleanExtra("autoSetup", false)) {

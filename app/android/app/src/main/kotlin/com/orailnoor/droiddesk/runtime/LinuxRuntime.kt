@@ -24,6 +24,12 @@ class LinuxRuntime(private val context: Context) {
         private const val SHEBANG_MARKER = ".relocated_text_paths_v3"
         private const val ELF_PATCH_MARKER = ".elf_runpaths_patched"
         private const val DE_MARKER = ".de_installed"
+        @Volatile private var INSTANCE: LinuxRuntime? = null
+        fun getInstance(ctx: Context): LinuxRuntime {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: LinuxRuntime(ctx.applicationContext).also { INSTANCE = it }
+            }
+        }
 
         // ELF64 constants
         private const val ELFMAG0: Byte = 0x7f
@@ -1527,12 +1533,21 @@ class LinuxRuntime(private val context: Context) {
     fun isUbuntuProotRunning(): Boolean {
         if (!isProotDistroInstalled("ubuntu")) return false
         return try {
-            // 直接在 host 执行 ps，绕开终端会话路由（executeCommand 会被终端劫持返回空）
-            val process = Runtime.getRuntime().exec(arrayOf("ps", "-A"))
-            val out = process.inputStream.bufferedReader().use { it.readText() }
-            val alive = out.contains("proot-distro") || out.contains("/bin/bash --login")
-            Log.d(TAG, "isUbuntuProotRunning: $alive")
-            alive
+            // 遍历 /proc/*/cmdline 检测 proot 进程。Android app 沙盒下 ps 被过滤为空，
+            // 直接读 /proc 能在 app 上下文工作。
+            val procDir = java.io.File("/proc")
+            val pidDirs = procDir.listFiles()?.filter { f ->
+                f.isDirectory && f.name.toIntOrNull() != null
+            } ?: emptyList()
+            val found = pidDirs.any { pidDir ->
+                try {
+                    val cmdline = java.io.File(pidDir, "cmdline").readBytes()
+                    val cmdStr = String(cmdline, Charsets.UTF_8).replace(' ', ' ')
+                    cmdStr.contains("proot-distro") || cmdStr.contains("proot")
+                } catch (_: Exception) { false }
+            }
+            Log.d(TAG, "isUbuntuProotRunning: $found")
+            found
         } catch (e: Exception) {
             Log.w(TAG, "isUbuntuProotRunning failed: ${e.message}")
             false
@@ -1547,17 +1562,22 @@ class LinuxRuntime(private val context: Context) {
     fun isUbuntuSshdRunning(): Boolean {
         if (!isUbuntuSshInstalled()) return false
         if (sshdProcess?.isAlive == true) return true
+        // Android 16 SELinux 沙盒拒绝 app 读取 /proc/net/tcp（EACCES）。
+        // 改用遍历 /proc/*/cmdline 查找 sshd 进程——app 能读自己的 cmdline。
         return try {
-            val portHex = 0x1FBA // sshPort 8122
-            val procNetTcp = java.io.File("/proc/net/tcp")
-            val alive = procNetTcp.readLines().any { line ->
-                val parts = line.split(Regex("\\s+"))
-                parts.size >= 4 && parts[3].equals("0A", ignoreCase = true) &&
-                    parts[1].startsWith("00000000:") &&
-                    parts[1].substringAfter(":").toLong(16) == portHex.toLong()
+            val procDir = java.io.File("/proc")
+            val pidDirs = procDir.listFiles()?.filter { f ->
+                f.isDirectory && f.name.toIntOrNull() != null
+            } ?: emptyList()
+            val found = pidDirs.any { pidDir ->
+                try {
+                    val cmdline = java.io.File(pidDir, "cmdline").readBytes()
+                    val cmdStr = String(cmdline, Charsets.UTF_8).replace(' ', ' ')
+                    cmdStr.contains("sshd")
+                } catch (_: Exception) { false }
             }
-            Log.d(TAG, "isUbuntuSshdRunning (port 8122): $alive")
-            alive
+            Log.d(TAG, "isUbuntuSshdRunning (via /proc cmdline): $found")
+            found
         } catch (e: Exception) {
             Log.w(TAG, "isUbuntuSshdRunning failed: ${e.message}")
             false
