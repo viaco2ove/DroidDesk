@@ -147,10 +147,11 @@ class DroidDeskPlatform {
     return Map<String, String>.from(result ?? {});
   }
 
-  static Future<void> setUbuntuCredentials(String user, String password) async {
+  static Future<void> setUbuntuCredentials(String user, String password, String port) async {
     await _channel.invokeMethod('setUbuntuCredentials', {
       'user': user,
       'password': password,
+      'port': port,
     });
   }
 

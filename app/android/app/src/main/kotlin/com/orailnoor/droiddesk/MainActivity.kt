@@ -395,6 +395,7 @@ class MainActivity : FlutterActivity() {
                     val creds = mapOf(
                         "user" to (sp.getString("user", "") ?: ""),
                         "password" to (sp.getString("password", "") ?: ""),
+                        "port" to (sp.getString("port", "22") ?: "22"),
                     )
                     result.success(creds)
                 }
@@ -402,12 +403,14 @@ class MainActivity : FlutterActivity() {
                 "setUbuntuCredentials" -> {
                     val user = call.argument<String>("user") ?: ""
                     val password = call.argument<String>("password") ?: ""
+                    val port = call.argument<String>("port") ?: "22"
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit()
                         .putString("user", user)
                         .putString("password", password)
+                        .putString("port", port)
                         .apply()
-                    applyUbuntuCredentials(user, password)
+                    applyUbuntuCredentials(user, password, port)
                     result.success(true)
                 }
 
@@ -649,10 +652,17 @@ class MainActivity : FlutterActivity() {
         Log.i(TAG, "Ubuntu settings applied; sshWithUbuntu=$sshWithUbuntu")
     }
 
-    private fun applyUbuntuCredentials(user: String, password: String) {
+    private fun applyUbuntuCredentials(user: String, password: String, port: String) {
         thread(name = "apply-ubuntu-credentials") {
             try {
                 if (user.isEmpty()) return@thread
+                val tmpDirPath = "${filesDir.absolutePath}/tmp/proot"
+                java.io.File(tmpDirPath).mkdirs()
+                val prootArgs = "login ubuntu " +
+                        "--bind \"${filesDir.absolutePath}/tmp:/tmp\" " +
+                        "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                        "--env PROOT_LOADER=\"${linuxRuntime.prefixPath}/libexec/proot/loader\" " +
+                        "--env PROOT_LOADER_32=\"${linuxRuntime.prefixPath}/libexec/proot/loader32\" --"
                 if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
                     val escaped = password.replace("'", "'\\''")
                     chrootRuntime.executeCommand(
@@ -661,15 +671,27 @@ class MainActivity : FlutterActivity() {
                     if (password.isNotEmpty()) {
                         chrootRuntime.executeCommand("echo '$user:$escaped' | chpasswd")
                     }
+                    // 修改 sshd 端口
+                    if (port.isNotEmpty()) {
+                        chrootRuntime.executeCommand(
+                            "sed -i 's/^#\\?Port .*/Port $port/' /etc/ssh/sshd_config"
+                        )
+                    }
                 } else if (linuxRuntime.isBootstrapped()) {
                     linuxRuntime.executeCommand(
-                        "proot-distro login ubuntu -- id -u $user >/dev/null 2>&1 || " +
-                        "proot-distro login ubuntu -- useradd -m -s /bin/bash $user"
+                        "proot-distro $prootArgs id -u $user >/dev/null 2>&1 || " +
+                        "proot-distro $prootArgs useradd -m -s /bin/bash $user"
                     )
                     if (password.isNotEmpty()) {
                         val escaped = password.replace("'", "'\\''")
                         linuxRuntime.executeCommand(
-                            "proot-distro login ubuntu -- bash -c \"echo '$user:$escaped' | chpasswd\""
+                            "proot-distro $prootArgs bash -c \"echo '$user:$escaped' | chpasswd\""
+                        )
+                    }
+                    // 修改 sshd 端口
+                    if (port.isNotEmpty()) {
+                        linuxRuntime.executeCommand(
+                            "proot-distro $prootArgs sed -i 's/^#\\?Port .*/Port $port/' /etc/ssh/sshd_config"
                         )
                     }
                 }

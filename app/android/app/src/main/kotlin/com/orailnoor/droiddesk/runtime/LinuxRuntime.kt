@@ -1450,40 +1450,64 @@ class LinuxRuntime(private val context: Context) {
         onProgress: ((Double, String) -> Unit)? = null,
     ): Boolean {
         if (!isBootstrapped() || !isProotDistroInstalled("ubuntu")) return false
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        java.io.File(tmpDirPath).mkdirs()
+        val baseArgs = "login ubuntu " +
+                "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+
         onProgress?.invoke(0.1, "Updating package lists...")
         if (executeCommand(
-            "proot-distro login ubuntu -- apt-get update"
+            "proot-distro $baseArgs apt-get update"
         ).startsWith("Error:")) {
             onProgress?.invoke(-1.0, "apt-get update failed")
             return false
         }
         onProgress?.invoke(0.4, "Installing openssh-server...")
         if (executeCommand(
-            "proot-distro login ubuntu -- apt-get install -y --no-install-recommends openssh-server"
+            "proot-distro $baseArgs apt-get install -y --no-install-recommends openssh-server"
         ).startsWith("Error:")) {
             onProgress?.invoke(-1.0, "apt-get install failed")
             return false
         }
         // Enable password authentication
         executeCommand(
-            "proot-distro login ubuntu -- sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+            "proot-distro $baseArgs sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
         )
         executeCommand(
-            "proot-distro login ubuntu -- sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+            "proot-distro $baseArgs sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
         )
-        executeCommand("proot-distro login ubuntu -- mkdir -p /run/sshd")
+        executeCommand("proot-distro $baseArgs mkdir -p /run/sshd")
+        // Set port from shared preferences if set
+        val sp = context.getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+        val port = sp.getString("port", "22") ?: "22"
+        if (port.isNotEmpty() && port != "22") {
+            executeCommand(
+                "proot-distro $baseArgs sed -i 's/^#\\?Port .*/Port $port/' /etc/ssh/sshd_config"
+            )
+            Log.i(TAG, "sshd configured to listen on port $port")
+        }
         onProgress?.invoke(0.9, "Generating host keys...")
-        executeCommand("proot-distro login ubuntu -- ssh-keygen -A")
+        executeCommand("proot-distro $baseArgs ssh-keygen -A")
         onProgress?.invoke(1.0, "openssh-server installed")
         return true
     }
 
     fun uninstallUbuntuSsh(): Boolean {
         if (!isBootstrapped()) return false
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        java.io.File(tmpDirPath).mkdirs()
+        val baseArgs = "login ubuntu " +
+                "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
         return try {
-            executeCommand("proot-distro login ubuntu -- bash -c " +
-                    "\"DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server\"")
-                .let { !it.startsWith("Error:") }
+            executeCommand(
+                "proot-distro $baseArgs bash -c \"DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server\""
+            ).let { !it.startsWith("Error:") }
         } catch (e: Exception) {
             Log.e(TAG, "uninstallUbuntuSsh failed", e)
             false

@@ -20,6 +20,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
 
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
+  final _portCtrl = TextEditingController();
 
   @override
   void initState() {
@@ -31,6 +32,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
   void dispose() {
     _userCtrl.dispose();
     _passCtrl.dispose();
+    _portCtrl.dispose();
     super.dispose();
   }
 
@@ -47,6 +49,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
         _sshInstalled = ssh;
         _userCtrl.text = creds['user'] ?? '';
         _passCtrl.text = creds['password'] ?? '';
+        _portCtrl.text = creds['port'] ?? '22';
       });
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -91,12 +94,14 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
 
   Future<void> _saveCredentials() async {
     final messenger = ScaffoldMessenger.of(context);
+    final port = int.tryParse(_portCtrl.text.trim()) ?? 22;
     await DroidDeskPlatform.setUbuntuCredentials(
       _userCtrl.text.trim(),
       _passCtrl.text,
+      port.toString(),
     );
     messenger.showSnackBar(
-      const SnackBar(content: Text('Credentials saved')),
+      SnackBar(content: Text('Credentials saved (port $port)')),
     );
   }
 
@@ -295,6 +300,16 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
                             border: OutlineInputBorder(),
                           ),
                         ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _portCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'SSH Port',
+                            hintText: '22',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
                         const SizedBox(height: 12),
                         Align(
                           alignment: Alignment.centerRight,
@@ -306,7 +321,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'These credentials will be applied inside Ubuntu on save.',
+                          'Credentials + SSH port applied inside Ubuntu on save.',
                           style: DroidTheme.bodySm,
                         ),
                       ],
