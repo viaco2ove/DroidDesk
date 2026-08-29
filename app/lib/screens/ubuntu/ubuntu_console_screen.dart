@@ -154,7 +154,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
                   _ActionTile(
                     icon: Icons.terminal_rounded,
                     title: 'Ubuntu Shell',
-                    subtitle: 'Open a full-screen native Ubuntu terminal',
+                    subtitle: 'Open a full-screen native Ubuntu terminal(back command:exit)',
                     color: const Color(0xFFE95420),
                     onTap: () {
                       // 立即跳转，不 await；让原生侧异步启动 terminal activity
