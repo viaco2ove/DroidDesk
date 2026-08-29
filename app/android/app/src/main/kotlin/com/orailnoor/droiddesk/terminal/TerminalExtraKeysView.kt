@@ -56,6 +56,17 @@ class TerminalExtraKeysView @JvmOverloads constructor(
         KeyDef("PGDN", "PGDN"),
     )
 
+    // 第三行：常用 Ctrl 组合 (用于一键中断等)
+    private val row3 = listOf(
+        KeyDef("^C", "CTRL_C"),  // Ctrl+C → SIGINT
+        KeyDef("^D", "CTRL_D"),  // Ctrl+D → EOF
+        KeyDef("^Z", "CTRL_Z"),  // Ctrl+Z → SIGTSTP
+        KeyDef("^L", "CTRL_L"),  // Ctrl+L → 清屏
+        KeyDef("^A", "CTRL_A"),  // 行首
+        KeyDef("^E", "CTRL_E"),  // 行尾
+        KeyDef("^K", "CTRL_K"),  // 删到行尾
+    )
+
     private val ESC = 0x1B.toByte()
 
     init {
@@ -65,6 +76,7 @@ class TerminalExtraKeysView @JvmOverloads constructor(
         setPadding(pad, pad, pad, pad)
         addView(buildRow(row1))
         addView(buildRow(row2))
+        addView(buildRow(row3))
     }
 
     private fun buildRow(keys: List<KeyDef>): View {
@@ -201,6 +213,20 @@ class TerminalExtraKeysView @JvmOverloads constructor(
                 return
             }
             else -> {
+                val ctrlChar = when (def.key) {
+                    "CTRL_C" -> 0x03
+                    "CTRL_D" -> 0x04
+                    "CTRL_Z" -> 0x1A
+                    "CTRL_L" -> 0x0C
+                    "CTRL_A" -> 0x01
+                    "CTRL_E" -> 0x05
+                    "CTRL_K" -> 0x0B
+                    else -> -1
+                }
+                if (ctrlChar >= 0) {
+                    writeBytes(tv, byteArrayOf(ctrlChar.toByte()))
+                    return
+                }
                 if (def.key.length == 1) {
                     tv.inputCodePoint(0, def.key[0].code, ctrlDown, altDown)
                 }
