@@ -15,6 +15,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.annotation.NonNull
 import androidx.annotation.Nullable
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
@@ -69,13 +70,28 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
             }
             Log.i(TAG, "TerminalView created")
 
-            val layout = FrameLayout(this).apply {
+            val layout = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
-                addView(terminalView)
+                addView(
+                    terminalView,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                    )
+                )
             }
+
+            // Extra keys 工具栏（在底部）
+            val extraKeys = TerminalExtraKeysView(this).apply {
+                terminalView = this@NativeTerminalActivity.terminalView
+            }
+            layout.addView(extraKeys)
+
             setContentView(layout)
             Log.i(TAG, "setContentView done")
 
