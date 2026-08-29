@@ -67,7 +67,12 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
 
   Future<void> _install(_OptionalApp app) async {
     final state = context.read<AppState>();
-    final ok = await state.installOptionalApp(app.id);
+
+    // Ubuntu 安装走 rootfs 下载/解压流程，其他走 apt 包安装
+    final ok = app.id == 'ubuntu_install'
+        ? await state.installUbuntu()
+        : await state.installOptionalApp(app.id);
+
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -84,7 +89,9 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final apps = state.hasRoot ? _apps : [..._apps, _proot];
+    // Ubuntu 始终显示（无 root 时按钮禁用）；PRoot 仅在无 root 时显示
+    final apps = _apps;
+    final extraApps = state.hasRoot ? <_OptionalApp>[] : <_OptionalApp>[_proot];
     return Scaffold(
       appBar: AppBar(title: const Text('Add applications')),
       body: Container(
@@ -105,6 +112,15 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
               _buildAppCard(state, app),
               const SizedBox(height: 10),
             ],
+            for (final app in extraApps) ...[
+              _buildAppCard(state, app),
+              const SizedBox(height: 10),
+            ],
+            // Ubuntu 安装过程中的下载/解压进度
+            if (state.isDownloading || state.isExtracting) ...[
+              const SizedBox(height: 12),
+              _buildUbuntuProgressPanel(state),
+            ],
             if (state.installingOptionalApp != null ||
                 state.optionalInstallLog.isNotEmpty) ...[
               const SizedBox(height: 12),
@@ -120,6 +136,12 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     final installed = state.optionalApps[app.id] == true;
     final installing = state.installingOptionalApp == app.id;
     final busy = state.installingOptionalApp != null;
+    // Ubuntu 安装进度判断（用 downloadProgress / extractProgress）
+    final ubuntuBusy =
+        app.id == 'ubuntu_install' && (state.isDownloading || state.isExtracting);
+    // Ubuntu 现在通过 proot-distro 安装，不需要 root
+    final needsRoot = false;
+    final buttonDisabled = busy || ubuntuBusy;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -156,7 +178,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
           const SizedBox(width: 10),
           if (installed)
             const Icon(Icons.check_circle_rounded, color: DroidTheme.success)
-          else if (installing)
+          else if (installing || ubuntuBusy)
             const SizedBox(
               width: 24,
               height: 24,
@@ -164,9 +186,51 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
             )
           else
             FilledButton(
-              onPressed: busy ? null : () => _install(app),
-              child: const Text('Install'),
+              onPressed: buttonDisabled ? null : () => _install(app),
+              child: Text(needsRoot ? 'Needs root' : 'Install'),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUbuntuProgressPanel(AppState state) {
+    final isDownload = state.isDownloading;
+    final progress = isDownload ? state.downloadProgress : state.extractProgress;
+    final status = isDownload ? state.downloadStatus : state.extractStatus;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF080D18),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: DroidTheme.warning.withValues(alpha: 0.45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.cloud_download_rounded,
+                  color: Color(0xFFE95420), size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isDownload ? 'Downloading Ubuntu rootfs' : 'Extracting Ubuntu rootfs',
+                  style: DroidTheme.headingSm,
+                ),
+              ),
+              Text(
+                '${(progress * 100).round()}%',
+                style: DroidTheme.monoSm,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          LinearProgressIndicator(value: progress),
+          if (status.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(status, style: DroidTheme.bodySm),
+          ],
         ],
       ),
     );

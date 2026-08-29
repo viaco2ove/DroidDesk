@@ -282,6 +282,55 @@ class ChrootRuntime(private val context: Context) {
     // ── Session management ──
 
     /**
+     * Install openssh-server inside the chroot.
+     */
+    fun installUbuntuSsh(
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {}
+    ): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        return try {
+            ensureMounts()
+            onProgress(0.1, "Installing openssh-server...")
+            val code = execChroot(
+                "DEBIAN_FRONTEND=noninteractive apt-get update -y && " +
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server",
+                onLog
+            )
+            if (code != 0) {
+                onProgress(-1.0, "apt-get failed")
+                return false
+            }
+            // Enable password auth
+            execChroot(
+                "sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config",
+                onLog
+            )
+            execChroot("mkdir -p /run/sshd", onLog)
+            onProgress(0.9, "Generating host keys...")
+            execChroot("ssh-keygen -A", onLog)
+            onProgress(1.0, "openssh-server installed")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "installUbuntuSsh failed", e)
+            onProgress(-1.0, "Install failed: ${e.message}")
+            false
+        }
+    }
+
+    fun uninstallUbuntuSsh(): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        return try {
+            ensureMounts()
+            execChroot("DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "uninstallUbuntuSsh failed", e)
+            false
+        }
+    }
+
+    /**
      * Start the chrooted desktop session.
      * The caller should ensure the X11 socket directory is mounted before this.
      */

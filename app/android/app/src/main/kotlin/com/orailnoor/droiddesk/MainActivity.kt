@@ -19,6 +19,7 @@ import com.orailnoor.droiddesk.x11.X11ServerService
 import kotlin.concurrent.thread
 import android.util.Log
 import android.widget.Toast
+import java.io.File
 
 class MainActivity : FlutterActivity() {
 
@@ -313,6 +314,106 @@ class MainActivity : FlutterActivity() {
                     result.success(status)
                 }
 
+                "isUbuntuInstalled" -> {
+                    val installed = if (chrootRuntime.hasRoot()) {
+                        chrootRuntime.isRootfsReady()
+                    } else {
+                        linuxRuntime.isProotDistroInstalled("ubuntu")
+                    }
+                    result.success(installed)
+                }
+
+                "launchUbuntuTerminal" -> {
+                    val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.terminal.NativeTerminalActivity::class.java)
+                    intent.putExtra("env", "ubuntu")
+                    startActivity(intent)
+                    result.success(true)
+                }
+
+                "getUbuntuSettings" -> {
+                    val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+                    val settings = mapOf(
+                        "daemon" to sp.getBoolean("daemon", false),
+                        "boot" to sp.getBoolean("boot", false),
+                        "sshWithUbuntu" to sp.getBoolean("sshWithUbuntu", false),
+                    )
+                    result.success(settings)
+                }
+
+                "setUbuntuSetting" -> {
+                    val key = call.argument<String>("key") ?: ""
+                    val value = call.argument<Boolean>("value") ?: false
+                    val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+                    sp.edit().putBoolean(key, value).apply()
+                    applyUbuntuSettings(sp)
+                    result.success(true)
+                }
+
+                "getUbuntuCredentials" -> {
+                    val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+                    val creds = mapOf(
+                        "user" to (sp.getString("user", "") ?: ""),
+                        "password" to (sp.getString("password", "") ?: ""),
+                    )
+                    result.success(creds)
+                }
+
+                "setUbuntuCredentials" -> {
+                    val user = call.argument<String>("user") ?: ""
+                    val password = call.argument<String>("password") ?: ""
+                    val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+                    sp.edit()
+                        .putString("user", user)
+                        .putString("password", password)
+                        .apply()
+                    applyUbuntuCredentials(user, password)
+                    result.success(true)
+                }
+
+                "isUbuntuSshInstalled" -> {
+                    val installed = if (chrootRuntime.hasRoot()) {
+                        File(chrootRuntime.getRootfsPath(), "usr/sbin/sshd").exists()
+                    } else {
+                        linuxRuntime.isUbuntuSshInstalled()
+                    }
+                    result.success(installed)
+                }
+
+                "installUbuntuSsh" -> {
+                    thread {
+                        val progressSink: (Double, String) -> Unit = { progress, status ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onOptionalInstallProgress",
+                                        mapOf("progress" to progress, "status" to status))
+                            }
+                        }
+                        val logSink: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onTerminalOutput", mapOf("text" to chunk))
+                            }
+                        }
+                        val ok = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.installUbuntuSsh(progressSink, logSink)
+                        } else {
+                            linuxRuntime.installUbuntuSsh(progressSink)
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "uninstallUbuntuSsh" -> {
+                    thread {
+                        val ok = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.uninstallUbuntuSsh()
+                        } else {
+                            linuxRuntime.uninstallUbuntuSsh()
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
                 "installOptionalApp" -> {
                     val appId = call.argument<String>("appId") ?: ""
                     thread {
@@ -492,6 +593,47 @@ class MainActivity : FlutterActivity() {
                 }
 
                 else -> result.notImplemented()
+            }
+        }
+    }
+
+    // ── Ubuntu Console helpers ──
+
+    private fun applyUbuntuSettings(sp: android.content.SharedPreferences) {
+        // sshWithUbuntu is enforced at session start time; here we just persist
+        // and rely on the lifecycle service / boot receiver to start sshd.
+        // A real implementation would update a service Intent; for now we
+        // persist the flag and let the launcher query it.
+        val sshWithUbuntu = sp.getBoolean("sshWithUbuntu", false)
+        Log.i(TAG, "Ubuntu settings applied; sshWithUbuntu=$sshWithUbuntu")
+    }
+
+    private fun applyUbuntuCredentials(user: String, password: String) {
+        thread(name = "apply-ubuntu-credentials") {
+            try {
+                if (user.isEmpty()) return@thread
+                if (chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
+                    val escaped = password.replace("'", "'\\''")
+                    chrootRuntime.executeCommand(
+                        "id -u $user >/dev/null 2>&1 || useradd -m -s /bin/bash $user"
+                    )
+                    if (password.isNotEmpty()) {
+                        chrootRuntime.executeCommand("echo '$user:$escaped' | chpasswd")
+                    }
+                } else if (linuxRuntime.isBootstrapped()) {
+                    linuxRuntime.executeCommand(
+                        "proot-distro login ubuntu -- id -u $user >/dev/null 2>&1 || " +
+                        "proot-distro login ubuntu -- useradd -m -s /bin/bash $user"
+                    )
+                    if (password.isNotEmpty()) {
+                        val escaped = password.replace("'", "'\\''")
+                        linuxRuntime.executeCommand(
+                            "proot-distro login ubuntu -- bash -c \"echo '$user:$escaped' | chpasswd\""
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to apply Ubuntu credentials", e)
             }
         }
     }

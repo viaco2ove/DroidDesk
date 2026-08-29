@@ -353,46 +353,24 @@ class AppState extends ChangeNotifier {
   Future<void> refreshOptionalApps() async {
     try {
       _optionalApps = await DroidDeskPlatform.getOptionalApps();
+      // 覆盖 ubuntu_install：必须调用原生 isUbuntuInstalled 重新确认
+      // (isBootstrapped 只表示 Termux bootstrap 已解压，不能用作 ubuntu_install 的状态)
+      try {
+        _optionalApps['ubuntu_install'] = await DroidDeskPlatform.isUbuntuInstalled();
+      } catch (_) {
+        // 原生不支持时保留 getOptionalApps 返回的状态
+      }
       notifyListeners();
     } catch (_) {
       // The desktop remains usable even if package status cannot be queried.
     }
   }
 
-  /// Install Ubuntu rootfs (download + extract)
+  /// Install Ubuntu rootfs via the platform-native path.
+  /// On rooted devices this uses chroot (download + extract).
+  /// On non-rooted devices this uses proot-distro install ubuntu.
   Future<bool> installUbuntu() async {
-    try {
-      _isDownloading = true;
-      _downloadProgress = 0.0;
-      _downloadStatus = 'Starting download...';
-      notifyListeners();
-
-      // Download rootfs
-      if (!await DroidDeskPlatform.downloadRootfs('ubuntu')) {
-        throw StateError('Download failed');
-      }
-
-      _isDownloading = false;
-      _isExtracting = true;
-      _extractProgress = 0.0;
-      _extractStatus = 'Extracting rootfs...';
-      notifyListeners();
-
-      // Extract rootfs
-      if (!await DroidDeskPlatform.extractRootfs()) {
-        throw StateError('Extraction failed');
-      }
-
-      _isExtracting = false;
-      await refreshStatus();
-      return true;
-    } catch (e) {
-      _errorMessage = 'Ubuntu installation failed: $e';
-      _isDownloading = false;
-      _isExtracting = false;
-      notifyListeners();
-      return false;
-    }
+    return await installOptionalApp('ubuntu_install');
   }
 
   Future<bool> installOptionalApp(String appId) async {

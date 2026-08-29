@@ -112,15 +112,31 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
         val shellPath: String
         val cwd: String
 
-        if (chroot.hasRoot() && chroot.isRootfsReady()) {
-            shellPath = "chroot ${chroot.getRootfsPath()} /bin/bash --login"
-            cwd = "/"
-        } else if (chroot.hasRoot()) {
-            shellPath = "/system/bin/sh"
-            cwd = "/"
-        } else {
-            shellPath = "/system/bin/sh"
-            cwd = "/"
+        // 当 Intent 带 "env"=ubuntu 时强制进 Ubuntu 终端
+        val envOverride = intent?.getStringExtra("env")
+
+        when {
+            envOverride == "ubuntu" && chroot.hasRoot() && chroot.isRootfsReady() -> {
+                shellPath = "chroot ${chroot.getRootfsPath()} /bin/bash --login"
+                cwd = "/"
+            }
+            envOverride == "ubuntu" -> {
+                // proot-distro 路径
+                shellPath = "proot-distro login ubuntu -- bash --login"
+                cwd = "/"
+            }
+            chroot.hasRoot() && chroot.isRootfsReady() -> {
+                shellPath = "chroot ${chroot.getRootfsPath()} /bin/bash --login"
+                cwd = "/"
+            }
+            chroot.hasRoot() -> {
+                shellPath = "/system/bin/sh"
+                cwd = "/"
+            }
+            else -> {
+                shellPath = "/system/bin/sh"
+                cwd = "/"
+            }
         }
 
         Log.i(TAG, "Starting session with shell: $shellPath")

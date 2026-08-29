@@ -120,6 +120,52 @@ class DroidDeskPlatform {
     return Map<String, bool>.from(result);
   }
 
+  static Future<bool> isUbuntuInstalled() async {
+    return await _channel.invokeMethod<bool>('isUbuntuInstalled') ?? false;
+  }
+
+  // ── Ubuntu Console ──
+
+  static Future<void> launchUbuntuTerminal() async {
+    await _channel.invokeMethod('launchUbuntuTerminal');
+  }
+
+  static Future<Map<String, bool>> getUbuntuSettings() async {
+    final result = await _channel.invokeMethod('getUbuntuSettings');
+    return Map<String, bool>.from(result ?? {});
+  }
+
+  static Future<void> setUbuntuSetting(String key, bool value) async {
+    await _channel.invokeMethod('setUbuntuSetting', {
+      'key': key,
+      'value': value,
+    });
+  }
+
+  static Future<Map<String, String>> getUbuntuCredentials() async {
+    final result = await _channel.invokeMethod('getUbuntuCredentials');
+    return Map<String, String>.from(result ?? {});
+  }
+
+  static Future<void> setUbuntuCredentials(String user, String password) async {
+    await _channel.invokeMethod('setUbuntuCredentials', {
+      'user': user,
+      'password': password,
+    });
+  }
+
+  static Future<bool> isUbuntuSshInstalled() async {
+    return await _channel.invokeMethod<bool>('isUbuntuSshInstalled') ?? false;
+  }
+
+  static Future<bool> installUbuntuSsh() async {
+    return await _channel.invokeMethod<bool>('installUbuntuSsh') ?? false;
+  }
+
+  static Future<bool> uninstallUbuntuSsh() async {
+    return await _channel.invokeMethod<bool>('uninstallUbuntuSsh') ?? false;
+  }
+
   static Future<bool> installOptionalApp(String appId) async {
     return await _channel.invokeMethod<bool>('installOptionalApp', {
           'appId': appId,

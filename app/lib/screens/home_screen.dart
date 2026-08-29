@@ -6,6 +6,7 @@ import 'package:droiddesk/state/app_state.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/screens/setup/de_install_screen.dart';
 import 'package:droiddesk/screens/apps/app_catalog_screen.dart';
+import 'package:droiddesk/screens/ubuntu/ubuntu_console_screen.dart';
 
 /// Home dashboard — shown after setup is complete.
 /// Central hub for launching the desktop, terminal, and managing the environment.
@@ -187,14 +188,14 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
 
-                      const SizedBox(height: 15),
+                      const SizedBox(height: 10),
 
                       // ── Terminal Native ──
                       _ActionCard(
                         icon: Icons.code_rounded,
                         title: 'Terminal Native',
                         subtitle:
-                            'Full-screen native terminal with chroot or Termux shell,get back command:exit',
+                            'get back command:exit，Full-screen native terminal with chroot or Termux shell',
                         color: const Color(0xFF00BFA5),
                         onTap: () {
                           DroidDeskPlatform.launchNativeTerminal();
@@ -211,6 +212,25 @@ class HomeScreen extends StatelessWidget {
                               'Open the optional minimal PRoot compatibility environment',
                           color: const Color(0xFFD70A53),
                           onTap: () => _showDebianTerminal(context, state),
+                        ),
+                      ],
+
+                      // Ubuntu Console - 当 Ubuntu 安装后显示
+                      if (state.optionalApps['ubuntu_install'] == true) ...[
+                        const SizedBox(height: 10),
+                        _ActionCard(
+                          icon: Icons.code_rounded,
+                          title: 'Ubuntu Console',
+                          subtitle:
+                              'Manage Ubuntu environment: terminal, daemon, SSH server',
+                          color: const Color(0xFFE95420),
+                          onTap: () {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => const UbuntuConsoleScreen(),
+                              ),
+                            );
+                          },
                         ),
                       ],
 
@@ -692,6 +712,7 @@ class _ActionCard extends StatelessWidget {
   final Color color;
   final Gradient? gradient;
   final VoidCallback onTap;
+  final int subtitleLines;
 
   const _ActionCard({
     required this.icon,
@@ -700,6 +721,7 @@ class _ActionCard extends StatelessWidget {
     required this.color,
     this.gradient,
     required this.onTap,
+    this.subtitleLines = 2,
   });
 
   @override
@@ -741,7 +763,7 @@ class _ActionCard extends StatelessWidget {
                   Text(
                     subtitle,
                     style: DroidTheme.bodySm,
-                    maxLines: 2,
+                    maxLines: subtitleLines,
                     overflow: TextOverflow.ellipsis,
                   ),
                 ],

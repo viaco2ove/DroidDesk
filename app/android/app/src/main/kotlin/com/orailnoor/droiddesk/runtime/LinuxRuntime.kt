@@ -129,6 +129,7 @@ class LinuxRuntime(private val context: Context) {
         "code_oss" to (File(binDir, "code-oss").exists() || File(binDir, "code").exists()),
         "nodejs" to (File(binDir, "node").exists() && File(binDir, "npm").exists()),
         "imagemagick" to (File(binDir, "magick").exists() || File(binDir, "convert").exists()),
+        "ubuntu_install" to isProotDistroInstalled("ubuntu"),
         "proot_debian" to isMinimalDebianInstalled(),
     )
 
@@ -230,6 +231,57 @@ class LinuxRuntime(private val context: Context) {
         // Legacy proot-distro releases
         File(prefixDir, "var/lib/proot-distro/installed-rootfs/debian/etc/os-release"),
     )
+
+    private fun ubuntuRootfsMarkers(): List<File> = listOf(
+        // proot-distro 5.4+
+        File(prefixDir, "var/lib/proot-distro/containers/ubuntu/rootfs/usr/lib/os-release"),
+        File(prefixDir, "var/lib/proot-distro/containers/ubuntu/rootfs/etc/os-release"),
+        // Legacy proot-distro releases
+        File(prefixDir, "var/lib/proot-distro/installed-rootfs/ubuntu/etc/os-release"),
+    )
+
+    fun isProotDistroInstalled(distro: String): Boolean {
+        val markers = when (distro) {
+            "ubuntu" -> ubuntuRootfsMarkers()
+            "debian" -> debianRootfsMarkers()
+            else -> return false
+        }
+        return markers.any(File::exists)
+    }
+
+    /**
+     * Install a proot-distro-based distribution (e.g. Ubuntu) without root.
+     * Uses `proot-distro install <name>` from the relocated Termux prefix.
+     */
+    private fun installProotDistro(
+        distro: String,
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        onProgress?.invoke(0.12, "Installing lightweight PRoot runtime...")
+        if (!installOptionalPackages(listOf("proot", "proot-distro"), onProgress, 0.28)) {
+            return false
+        }
+        patchShebangs(force = true)
+        relocateProotExecutable()
+        if (executeCommand("proot --version").startsWith("Error:")) {
+            Log.e(TAG, "Installed PRoot executable could not start")
+            return false
+        }
+
+        if (!isProotDistroInstalled(distro)) {
+            onProgress?.invoke(0.38, "Downloading $distro rootfs via proot-distro...")
+            // Clean interrupted extraction so proot-distro can retry.
+            File(prefixDir, "var/lib/proot-distro/containers/$distro").deleteRecursively()
+            File(prefixDir, "var/lib/proot-distro/installed-rootfs/$distro").deleteRecursively()
+            if (executeCommand("proot-distro install $distro").startsWith("Error:")) {
+                Log.e(TAG, "proot-distro install $distro failed")
+                return false
+            }
+        }
+        clearProotDownloadCache()
+        onProgress?.invoke(1.0, "$distro rootfs is ready")
+        return isProotDistroInstalled(distro)
+    }
 
     // ── Bootstrap ──
 
@@ -1381,11 +1433,62 @@ class LinuxRuntime(private val context: Context) {
         return true
     }
 
+    fun isUbuntuSshInstalled(): Boolean {
+        if (!isBootstrapped()) return false
+        val prootRoot5 = File(prefixDir, "var/lib/proot-distro/containers/ubuntu/rootfs/usr/sbin/sshd")
+        val prootRoot6 = File(prefixDir, "var/lib/proot-distro/containers/ubuntu/rootfs/usr/lib/os-release")
+        val legacyRoot = File(prefixDir, "var/lib/proot-distro/installed-rootfs/ubuntu/usr/sbin/sshd")
+        val legacyMarker = File(prefixDir, "var/lib/proot-distro/installed-rootfs/ubuntu/etc/os-release")
+        val installed = prootRoot5.exists() || legacyRoot.exists()
+        // Confirm the proot-distro container actually exists first; if not, sshd
+        // path inside it cannot exist either.
+        return installed && (prootRoot6.exists() || legacyMarker.exists())
+    }
+
+    fun installUbuntuSsh(
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        if (!isBootstrapped() || !isProotDistroInstalled("ubuntu")) return false
+        onProgress?.invoke(0.1, "Installing openssh-server...")
+        val result = executeCommand(
+            "proot-distro login ubuntu -- bash -c " +
+            "\"DEBIAN_FRONTEND=noninteractive apt-get update && " +
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server " +
+            "&& sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config " +
+            "&& mkdir -p /run/sshd && ssh-keygen -A\""
+        )
+        if (result.startsWith("Error:")) {
+            onProgress?.invoke(-1.0, "Install failed")
+            return false
+        }
+        onProgress?.invoke(1.0, "openssh-server installed")
+        return true
+    }
+
+    fun uninstallUbuntuSsh(): Boolean {
+        if (!isBootstrapped()) return false
+        return try {
+            executeCommand("proot-distro login ubuntu -- bash -c " +
+                    "\"DEBIAN_FRONTEND=noninteractive apt-get purge -y openssh-server\"")
+                .let { !it.startsWith("Error:") }
+        } catch (e: Exception) {
+            Log.e(TAG, "uninstallUbuntuSsh failed", e)
+            false
+        }
+    }
+
     fun installOptionalApp(
         appId: String,
         onProgress: ((Double, String) -> Unit)? = null,
     ): Boolean {
-        if (getInstalledDE().isEmpty()) return false
+        // ubuntu_install / proot_debian 通过 proot-distro 安装，仅需 bootstrap 就绪
+        val usesProotOnly = appId == "ubuntu_install" || appId == "proot_debian"
+        if (!usesProotOnly) {
+            if (getInstalledDE().isEmpty()) return false
+        } else if (!isBootstrapped()) {
+            Log.e(TAG, "Bootstrap not extracted; cannot install $appId")
+            return false
+        }
         if (getOptionalAppsStatus()[appId] == true) {
             onProgress?.invoke(1.0, "Already installed")
             return true
@@ -1399,8 +1502,11 @@ class LinuxRuntime(private val context: Context) {
             if (!isDpkgPackageInstalled("nodejs") && !installRelocatedNodejs()) return false
         }
 
-        onProgress?.invoke(0.18, "Repairing interrupted packages...")
-        if (!installPackageGroup("dpkg --configure -a")) return false
+        // proot-only 应用不需要 DE 的 dpkg configure pass
+        if (!usesProotOnly) {
+            onProgress?.invoke(0.18, "Repairing interrupted packages...")
+            if (!installPackageGroup("dpkg --configure -a")) return false
+        }
 
         val ok = when (appId) {
             "firefox" -> {
@@ -1421,6 +1527,10 @@ class LinuxRuntime(private val context: Context) {
             "imagemagick" -> {
                 onProgress?.invoke(0.25, "Installing ImageMagick...")
                 installOptionalPackages(listOf("imagemagick"), onProgress, 0.55)
+            }
+            "ubuntu_install" -> {
+                // proot-distro install 不需要 root
+                installProotDistro("ubuntu", onProgress)
             }
             "proot_debian" -> installMinimalDebian(onProgress)
             else -> false
