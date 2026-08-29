@@ -187,14 +187,14 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
 
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 15),
 
                       // ── Terminal Native ──
                       _ActionCard(
                         icon: Icons.code_rounded,
                         title: 'Terminal Native',
                         subtitle:
-                            'Full-screen native terminal with chroot or Termux shell',
+                            'Full-screen native terminal with chroot or Termux shell,get back command:exit',
                         color: const Color(0xFF00BFA5),
                         onTap: () {
                           DroidDeskPlatform.launchNativeTerminal();

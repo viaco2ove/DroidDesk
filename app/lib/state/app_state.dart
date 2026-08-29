@@ -359,6 +359,42 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Install Ubuntu rootfs (download + extract)
+  Future<bool> installUbuntu() async {
+    try {
+      _isDownloading = true;
+      _downloadProgress = 0.0;
+      _downloadStatus = 'Starting download...';
+      notifyListeners();
+
+      // Download rootfs
+      if (!await DroidDeskPlatform.downloadRootfs('ubuntu')) {
+        throw StateError('Download failed');
+      }
+
+      _isDownloading = false;
+      _isExtracting = true;
+      _extractProgress = 0.0;
+      _extractStatus = 'Extracting rootfs...';
+      notifyListeners();
+
+      // Extract rootfs
+      if (!await DroidDeskPlatform.extractRootfs()) {
+        throw StateError('Extraction failed');
+      }
+
+      _isExtracting = false;
+      await refreshStatus();
+      return true;
+    } catch (e) {
+      _errorMessage = 'Ubuntu installation failed: $e';
+      _isDownloading = false;
+      _isExtracting = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
   Future<bool> installOptionalApp(String appId) async {
     if (_installingOptionalApp != null) return false;
     _installingOptionalApp = appId;

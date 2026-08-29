@@ -40,6 +40,13 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
       icon: Icons.image_rounded,
       color: DroidTheme.primaryLight,
     ),
+    _OptionalApp(
+      id: 'ubuntu_install',
+      name: 'Ubuntu',
+      description: 'Download and set up Ubuntu 24.04 rootfs. Required for chroot mode.',
+      icon: Icons.cloud_download_rounded,
+      color: Color(0xFFE95420),
+    )
   ];
 
   static const _proot = _OptionalApp(
