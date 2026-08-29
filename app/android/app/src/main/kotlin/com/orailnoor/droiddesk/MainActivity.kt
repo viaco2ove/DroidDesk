@@ -324,10 +324,23 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "launchUbuntuTerminal" -> {
-                    val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.terminal.NativeTerminalActivity::class.java)
-                    intent.putExtra("env", "ubuntu")
-                    startActivity(intent)
-                    result.success(true)
+                    Log.i(TAG, "launchUbuntuTerminal invoked")
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Launching Ubuntu terminal...", Toast.LENGTH_SHORT).show()
+                    }
+                    try {
+                        val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.terminal.NativeTerminalActivity::class.java)
+                        intent.putExtra("env", "ubuntu")
+                        startActivity(intent)
+                        Log.i(TAG, "launchUbuntuTerminal: startActivity ok")
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "launchUbuntuTerminal failed", e)
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Launch failed: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                        result.error("LAUNCH_FAILED", e.message, null)
+                    }
                 }
 
                 "getUbuntuSettings" -> {

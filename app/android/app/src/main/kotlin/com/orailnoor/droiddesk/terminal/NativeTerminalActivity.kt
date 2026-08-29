@@ -121,8 +121,9 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
                 cwd = "/"
             }
             envOverride == "ubuntu" -> {
-                // proot-distro 路径
-                shellPath = "proot-distro login ubuntu -- bash --login"
+                // proot-distro 路径；先尝试 wrapper，找不到就退到普通 shell
+                val wrapper = java.io.File(filesDir, "bin/start-ubuntu-shell.sh")
+                shellPath = if (wrapper.exists()) "sh ${wrapper.absolutePath}" else "/system/bin/sh"
                 cwd = "/"
             }
             chroot.hasRoot() && chroot.isRootfsReady() -> {

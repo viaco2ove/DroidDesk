@@ -156,7 +156,10 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
                     title: 'Ubuntu Shell',
                     subtitle: 'Open a full-screen native Ubuntu terminal',
                     color: const Color(0xFFE95420),
-                    onTap: () => DroidDeskPlatform.launchUbuntuTerminal(),
+                    onTap: () {
+                      // 立即跳转，不 await；让原生侧异步启动 terminal activity
+                      DroidDeskPlatform.launchUbuntuTerminal();
+                    },
                   ),
 
                   const SizedBox(height: 16),

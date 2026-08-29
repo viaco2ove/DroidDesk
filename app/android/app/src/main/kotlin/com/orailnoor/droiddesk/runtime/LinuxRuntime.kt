@@ -81,6 +81,7 @@ class LinuxRuntime(private val context: Context) {
 
     private val baseDir: File get() = context.filesDir
     private val prefixDir: File get() = File(baseDir, "usr")
+    val prefixPath: String get() = prefixDir.absolutePath
     private val binDir: File get() = File(prefixDir, "bin")
     private val libDir: File get() = File(prefixDir, "lib")
     // Shared with X11ServerService. X clients resolve /tmp/.X11-unix/X0 here
@@ -1449,18 +1450,30 @@ class LinuxRuntime(private val context: Context) {
         onProgress: ((Double, String) -> Unit)? = null,
     ): Boolean {
         if (!isBootstrapped() || !isProotDistroInstalled("ubuntu")) return false
-        onProgress?.invoke(0.1, "Installing openssh-server...")
-        val result = executeCommand(
-            "proot-distro login ubuntu -- bash -c " +
-            "\"DEBIAN_FRONTEND=noninteractive apt-get update && " +
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server " +
-            "&& sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config " +
-            "&& mkdir -p /run/sshd && ssh-keygen -A\""
-        )
-        if (result.startsWith("Error:")) {
-            onProgress?.invoke(-1.0, "Install failed")
+        onProgress?.invoke(0.1, "Updating package lists...")
+        if (executeCommand(
+            "proot-distro login ubuntu -- apt-get update"
+        ).startsWith("Error:")) {
+            onProgress?.invoke(-1.0, "apt-get update failed")
             return false
         }
+        onProgress?.invoke(0.4, "Installing openssh-server...")
+        if (executeCommand(
+            "proot-distro login ubuntu -- apt-get install -y --no-install-recommends openssh-server"
+        ).startsWith("Error:")) {
+            onProgress?.invoke(-1.0, "apt-get install failed")
+            return false
+        }
+        // Enable password authentication
+        executeCommand(
+            "proot-distro login ubuntu -- sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+        )
+        executeCommand(
+            "proot-distro login ubuntu -- sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+        )
+        executeCommand("proot-distro login ubuntu -- mkdir -p /run/sshd")
+        onProgress?.invoke(0.9, "Generating host keys...")
+        executeCommand("proot-distro login ubuntu -- ssh-keygen -A")
         onProgress?.invoke(1.0, "openssh-server installed")
         return true
     }
