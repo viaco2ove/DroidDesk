@@ -53,8 +53,23 @@ public final class TerminalSession extends TerminalOutput {
     /** Callback which gets notified when a session finishes or changes title. */
     TerminalSessionClient mClient;
 
+    /** Set the session client. Used by DroidDesk to swap clients when activity is destroyed. */
+    public void setSessionClientPublic(TerminalSessionClient client) {
+        mClient = client;
+    }
+
+    /** Get the session client. */
+    public TerminalSessionClient getSessionClientPublic() {
+        return mClient;
+    }
+
     /** The pid of the shell process. 0 if not started and -1 if finished running. */
     int mShellPid;
+
+    /** Public getter for shell pid (originally package-private). */
+    public int getShellPidPublic() {
+        return mShellPid;
+    }
 
     /** The exit status of the shell process. Only valid if ${@link #mShellPid} is -1. */
     int mShellExitStatus;

@@ -644,6 +644,9 @@ public final class TerminalView extends View {
 
     @Override
     public boolean onKeyPreIme(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            android.util.Log.i("TerminalView", "onKeyPreIme BACK action=" + event.getAction() + " selecting=" + isSelectingText() + " mapToEsc=" + mClient.shouldBackButtonBeMappedToEscape());
+        }
         if (TERMINAL_VIEW_KEY_LOGGING_ENABLED)
             mClient.logInfo(LOG_TAG, "onKeyPreIme(keyCode=" + keyCode + ", event=" + event + ")");
         if (keyCode == KeyEvent.KEYCODE_BACK) {
