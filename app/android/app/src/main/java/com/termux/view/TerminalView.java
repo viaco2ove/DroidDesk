@@ -644,9 +644,6 @@ public final class TerminalView extends View {
 
     @Override
     public boolean onKeyPreIme(int keyCode, KeyEvent event) {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
-            android.util.Log.i("TerminalView", "onKeyPreIme BACK action=" + event.getAction() + " selecting=" + isSelectingText() + " mapToEsc=" + mClient.shouldBackButtonBeMappedToEscape());
-        }
         if (TERMINAL_VIEW_KEY_LOGGING_ENABLED)
             mClient.logInfo(LOG_TAG, "onKeyPreIme(keyCode=" + keyCode + ", event=" + event + ")");
         if (keyCode == KeyEvent.KEYCODE_BACK) {
@@ -781,6 +778,11 @@ public final class TerminalView extends View {
             invalidate();
             return true;
         } else if (event.isSystem() && (!mClient.shouldBackButtonBeMappedToEscape() || keyCode != KeyEvent.KEYCODE_BACK)) {
+            return super.onKeyDown(keyCode, event);
+        } else if (keyCode == KeyEvent.KEYCODE_BACK && !mClient.shouldBackButtonBeMappedToEscape()) {
+            // Non system-flagged BACK (e.g. synthetic key events injected by the predictive back
+            // legacy fallback). Do not map it to ESC here; let it bubble up to the hosting
+            // activity so it can finish itself.
             return super.onKeyDown(keyCode, event);
         } else if (event.getAction() == KeyEvent.ACTION_MULTIPLE && keyCode == KeyEvent.KEYCODE_UNKNOWN) {
             mTermSession.write(event.getCharacters());
@@ -966,8 +968,10 @@ public final class TerminalView extends View {
         if (mClient.onKeyUp(keyCode, event)) {
             invalidate();
             return true;
-        } else if (event.isSystem()) {
-            // Let system key events through.
+        } else if (event.isSystem() || (keyCode == KeyEvent.KEYCODE_BACK && !mClient.shouldBackButtonBeMappedToEscape())) {
+            // Let system key events through. Also let non system-flagged BACK through
+            // (synthetic events from predictive back fallback) so the hosting activity
+            // receives it and can finish itself.
             return super.onKeyUp(keyCode, event);
         }
 

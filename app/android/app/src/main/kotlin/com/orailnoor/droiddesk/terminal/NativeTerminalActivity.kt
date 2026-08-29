@@ -3,6 +3,7 @@ package com.orailnoor.droiddesk.terminal
 import android.app.Activity
 import android.content.Context
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,6 +20,8 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import androidx.annotation.NonNull
 import androidx.annotation.Nullable
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
@@ -56,9 +59,29 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
     // 记录当前 attach 的 session env tag (ubuntu / 普通)
     private var currentEnvTag: String = ""
 
+    /**
+     * Android 13+ 预测性返回：系统返回手势/返回键通过 OnBackInvokedDispatcher 分发，
+     * onBackPressed() 不再被调用。注册自己的回调确保返回时退出（保留后台会话）。
+     * 使用 PRIORITY_OVERLAY 保证优先于 ViewRootImpl 内部默认回调——那个默认回调会把
+     * back 转成合成 KEYCODE_BACK 按键事件，曾被 TerminalView 吞掉导致无法退出。
+     */
+    private val backInvokedCallback = OnBackInvokedCallback {
+        Log.i(TAG, "OnBackInvoked -> finish (session kept alive)")
+        finish()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         Log.i(TAG, "onCreate start")
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 延迟到窗口 attach 之后注册，确保拿到的是真正的
+            // WindowOnBackInvokedDispatcher（onCreate 时可能还是 proxy/fallback）。
+            window.decorView.post {
+                onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_OVERLAY, backInvokedCallback
+                )
+            }
+        }
         try {
             val density = resources.displayMetrics.density
             var fontSize = Math.round(DEFAULT_FONT_SIZE * density)
@@ -236,6 +259,28 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
         super.onBackPressed()
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            // 部分 ROM (如本机 ColorOS/Android 16) 虽在 manifest 声明了
+            // enableOnBackInvokedCallback=true，实际却走"传统"路径：把返回手势/返回键
+            // 转成合成 KEYCODE_BACK 系统按键派发，且不回调 OnBackInvokedCallback。
+            // 因此在 Activity 入口直接处理 BACK：结束自身（保留后台 shell 会话）。
+            // 文本选择模式下 onKeyPreIme 会先消费 BACK（停止选择），不会走到这里。
+            if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                Log.i(TAG, "BACK handled -> finish (session kept alive)")
+                finish()
+                return true
+            }
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                return true // DOWN 也消费掉，避免 TerminalView 收到产生副作用
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    // 注意：不能 override Activity.onKeyDown/onKeyUp —— 与 TerminalViewClient 的
+    // 同签名方法在 JVM 层冲突。用 dispatchKeyEvent 观察按键分发。
+
 override fun onResume() {
         super.onResume()
         terminalView.requestFocus()
@@ -257,6 +302,13 @@ override fun onResume() {
         // 把 client 切换到 dummy，防止回调到已 destroy 的 activity
         terminalSession?.let { sess ->
             sess.setSessionClientPublic(NoOpSessionClient)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(backInvokedCallback)
+            } catch (e: Throwable) {
+                Log.w(TAG, "unregister back callback failed: ${e.message}")
+            }
         }
         super.onDestroy()
     }
