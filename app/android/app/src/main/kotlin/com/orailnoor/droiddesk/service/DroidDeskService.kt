@@ -8,10 +8,12 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
-import kotlin.concurrent.thread
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.orailnoor.droiddesk.MainActivity
@@ -33,11 +35,17 @@ class DroidDeskService : Service() {
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var workerThread: HandlerThread? = null
+    private var workerHandler: Handler? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         acquireWakeLock()
+        // HandlerThread 的消息队列在 service 进程内，service 被杀时 Looper 会连带停止
+        // 线程优先级默认 THREAD_PRIORITY_BACKGROUND，比 kotlin.concurrent.thread 高
+        workerThread = HandlerThread("DroidDeskWorker", Thread.MIN_PRIORITY).apply { start() }
+        workerHandler = Handler(workerThread!!.looper)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -60,19 +68,23 @@ class DroidDeskService : Service() {
         // ColorOS / MIUI 等国产 ROM 智能冻结：app 退到后台后即使有前台 service 也会被冻结，
         // 导致 proot/sshd 子进程不响应 I/O。SYSTEM_ALERT_WINDOW 让系统认为 app 处于"用户可见"状态，
         // 通常不会冻结，从而保住底层进程。
-        if (sp.getBoolean("keepAliveFloat", true)) {
+        val keepAliveEnabled = sp.getBoolean("keepAliveFloat", true)
+        Log.i(TAG, "keepAliveFloat check: enabled=$keepAliveEnabled, canDrawOverlays=${android.provider.Settings.canDrawOverlays(this)}")
+        if (keepAliveEnabled) {
             try {
                 if (android.provider.Settings.canDrawOverlays(this)) {
+                    Log.i(TAG, "Attempting to show keep-alive float...")
                     KeepAliveFloat.show(this)
+                    Log.i(TAG, "KeepAliveFloat.show() returned, isShowing=${KeepAliveFloat.isShowing()}")
                 } else {
                     Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted; skip keep-alive float")
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Keep-alive float init failed: ${e.message}")
+                Log.w(TAG, "Keep-alive float init failed: ${e.message}", e)
             }
         }
         if (sp.getBoolean("daemon", false)) {
-            thread(name = "daemon-restore") {
+            workerHandler?.post {
                 try {
                     val runtime = LinuxRuntime.getInstance(this)
                     if (!runtime.isUbuntuProotRunning()) {
@@ -151,6 +163,9 @@ class DroidDeskService : Service() {
     override fun onDestroy() {
         KeepAliveFloat.dismiss()
         releaseWakeLock()
+        workerThread?.quitSafely()
+        workerThread = null
+        workerHandler = null
         super.onDestroy()
     }
 

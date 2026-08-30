@@ -392,9 +392,8 @@ class MainActivity : FlutterActivity() {
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit().putBoolean(key, value).apply()
                     applyUbuntuSettings(sp)
-                    // 守护 / sshWithUbuntu 开关开启时，确保前台服务在线以保护子进程
-                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat") && value &&
-                        linuxRuntime.isBootstrapped() && linuxRuntime.isProotDistroInstalled("ubuntu")) {
+                    // 守护 / sshWithUbuntu / keepAliveFloat 开关开启时，确保前台服务在线以保护子进程
+                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat") && value) {
                         startForegroundService()
                     }
                     result.success(true)
@@ -800,6 +799,21 @@ class MainActivity : FlutterActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to apply Ubuntu credentials", e)
+            }
+        }
+    }
+
+    // ── Lifecycle ──
+
+    override fun onResume() {
+        super.onResume()
+        // 从 Settings（悬浮窗授权页）返回后，重新检测权限并启动 service
+        // 这样用户在授权页面点"允许"回来后，悬浮窗就能正确显示了
+        if (android.provider.Settings.canDrawOverlays(this)) {
+            val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
+            if (sp.getBoolean("keepAliveFloat", true)) {
+                Log.i(TAG, "onResume: overlay granted, starting foreground service")
+                startForegroundService()
             }
         }
     }
