@@ -12,11 +12,13 @@ class UbuntuConsoleScreen extends StatefulWidget {
   State<UbuntuConsoleScreen> createState() => _UbuntuConsoleScreenState();
 }
 
-class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
+class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsBindingObserver {
   bool _daemonEnabled = false;
   bool _bootEnabled = false;
   bool _sshWithUbuntu = false;
   bool _sshInstalled = false;
+  bool _keepAliveFloat = true;
+  bool _canDrawOverlays = false;
   bool _loading = true;
 
   // 运行时状态
@@ -33,17 +35,40 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
     _statusTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshStatus());
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _statusTimer?.cancel();
     _userCtrl.dispose();
     _passCtrl.dispose();
     _portCtrl.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // 从 Settings 等页面返回，刷新权限状态
+      _refreshOverlayPermission();
+    }
+  }
+
+  Future<void> _refreshOverlayPermission() async {
+    final canFloat = await DroidDeskPlatform.canDrawOverlays();
+    if (!mounted) return;
+    setState(() {
+      _canDrawOverlays = canFloat;
+      if (canFloat && !_keepAliveFloat) {
+        // 权限已授权但开关还关着，帮用户打开
+        _keepAliveFloat = true;
+        _toggle('keepAliveFloat', true);
+      }
+    });
   }
 
   Future<void> _refreshStatus() async {
@@ -87,11 +112,14 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> {
       final settings = await DroidDeskPlatform.getUbuntuSettings();
       final creds = await DroidDeskPlatform.getUbuntuCredentials();
       final ssh = await DroidDeskPlatform.isUbuntuSshInstalled();
+      final canFloat = await DroidDeskPlatform.canDrawOverlays();
       setState(() {
         _daemonEnabled = settings['daemon'] ?? false;
         _bootEnabled = settings['boot'] ?? false;
         _sshWithUbuntu = settings['sshWithUbuntu'] ?? false;
         _sshInstalled = ssh;
+        _keepAliveFloat = settings['keepAliveFloat'] ?? true;
+        _canDrawOverlays = canFloat;
         _userCtrl.text = creds['user'] ?? '';
         _passCtrl.text = creds['password'] ?? '';
         _portCtrl.text = creds['port'] ?? '22';
@@ -254,6 +282,44 @@ const SizedBox(height: 16),
                         },
                         title: const Text('Boot at startup'),
                         subtitle: const Text('Launch Ubuntu when device boots'),
+                        activeColor: const Color(0xFFE95420),
+                      ),
+                      const Divider(height: 1, color: DroidTheme.surfaceBorder),
+                      SwitchListTile(
+                        value: _keepAliveFloat,
+                        onChanged: (v) async {
+                          if (v && !_canDrawOverlays) {
+                            // 先把开关值持久化，让 service 提前启动（等授权回来后 onResume 会补上）
+                            if (mounted) setState(() => _keepAliveFloat = v);
+                            _toggle('keepAliveFloat', v);
+                            // 打开 Settings 授权页，用户授权后回来 onResume 会检测并显示悬浮窗
+                            await DroidDeskPlatform.requestOverlayPermission();
+                            if (mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('请在设置中开启「显示悬浮窗」权限后返回'),
+                                  duration: Duration(seconds: 3),
+                                ),
+                              );
+                            }
+                            return;
+                          }
+                          if (mounted) setState(() => _keepAliveFloat = v);
+                          _toggle('keepAliveFloat', v);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(v
+                                    ? '保活悬浮窗已开启'
+                                    : '保活悬浮窗已关闭'),
+                              ),
+                            );
+                          }
+                        },
+                        title: const Text('Keep-alive overlay'),
+                        subtitle: Text(_canDrawOverlays
+                            ? 'Show floating icon to prevent background freezing'
+                            : '需要「显示悬浮窗」权限'),
                         activeColor: const Color(0xFFE95420),
                       ),
                     ],

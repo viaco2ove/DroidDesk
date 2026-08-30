@@ -142,6 +142,15 @@ class DroidDeskPlatform {
     });
   }
 
+  static Future<bool> canDrawOverlays() async {
+    final r = await _channel.invokeMethod<bool>('canDrawOverlays');
+    return r ?? false;
+  }
+
+  static Future<void> requestOverlayPermission() async {
+    await _channel.invokeMethod('requestOverlayPermission');
+  }
+
   static Future<Map<String, String>> getUbuntuCredentials() async {
     final result = await _channel.invokeMethod('getUbuntuCredentials');
     return Map<String, String>.from(result ?? {});
