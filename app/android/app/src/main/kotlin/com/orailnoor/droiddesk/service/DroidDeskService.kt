@@ -54,8 +54,23 @@ class DroidDeskService : Service() {
             }
         )
 
-        // 守护模式下：确保 Ubuntu 会话已启动
+        // 守护模式下：确保 Ubuntu 会话已启动 + sshd 在跑
         val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
+
+        // ColorOS / MIUI 等国产 ROM 智能冻结：app 退到后台后即使有前台 service 也会被冻结，
+        // 导致 proot/sshd 子进程不响应 I/O。SYSTEM_ALERT_WINDOW 让系统认为 app 处于"用户可见"状态，
+        // 通常不会冻结，从而保住底层进程。
+        if (sp.getBoolean("keepAliveFloat", true)) {
+            try {
+                if (android.provider.Settings.canDrawOverlays(this)) {
+                    KeepAliveFloat.show(this)
+                } else {
+                    Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted; skip keep-alive float")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Keep-alive float init failed: ${e.message}")
+            }
+        }
         if (sp.getBoolean("daemon", false)) {
             thread(name = "daemon-restore") {
                 try {
@@ -63,6 +78,13 @@ class DroidDeskService : Service() {
                     if (!runtime.isUbuntuProotRunning()) {
                         Log.i(TAG, "Daemon active, restoring Ubuntu session...")
                         restoreUbuntuSession(runtime)
+                    }
+                    // sshWithUbuntu=true 时确保 sshd 也在跑
+                    if (sp.getBoolean("sshWithUbuntu", false) &&
+                        runtime.isUbuntuSshInstalled() &&
+                        !runtime.isUbuntuSshdRunning()) {
+                        Log.i(TAG, "Daemon active, starting sshd...")
+                        runtime.startUbuntuSshd()
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to restore Ubuntu session: ${e.message}")
@@ -127,6 +149,7 @@ class DroidDeskService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        KeepAliveFloat.dismiss()
         releaseWakeLock()
         super.onDestroy()
     }

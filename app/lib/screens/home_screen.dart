@@ -203,8 +203,10 @@ class HomeScreen extends StatelessWidget {
                       ),
 
                       // ── Ubuntu Status (real-time) ──
-                      const SizedBox(height: 10),
-                      _UbuntuStatusCard(),
+                      if (state.optionalApps['ubuntu_install'] == true) ...[
+                        const SizedBox(height: 10),
+                        _UbuntuStatusCard(),
+                      ],
 
                       if (!state.hasRoot &&
                           state.optionalApps['proot_debian'] == true) ...[

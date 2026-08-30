@@ -325,6 +325,10 @@ class MainActivity : FlutterActivity() {
 
                 "launchUbuntuTerminal" -> {
                     Log.i(TAG, "launchUbuntuTerminal invoked")
+                    // 启动前台服务，确保 ubuntu 会话退到后台后不被 Phantom Process Killer 杀掉
+                    if (linuxRuntime.isBootstrapped() && linuxRuntime.isProotDistroInstalled("ubuntu")) {
+                        startForegroundService()
+                    }
                     // 把完整的 shell 命令写到文件，绕过执行位问题
                     if (linuxRuntime.isBootstrapped()) {
                         val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
@@ -377,6 +381,7 @@ class MainActivity : FlutterActivity() {
                         "daemon" to sp.getBoolean("daemon", false),
                         "boot" to sp.getBoolean("boot", false),
                         "sshWithUbuntu" to sp.getBoolean("sshWithUbuntu", false),
+                        "keepAliveFloat" to sp.getBoolean("keepAliveFloat", true),
                     )
                     result.success(settings)
                 }
@@ -387,6 +392,11 @@ class MainActivity : FlutterActivity() {
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit().putBoolean(key, value).apply()
                     applyUbuntuSettings(sp)
+                    // 守护 / sshWithUbuntu 开关开启时，确保前台服务在线以保护子进程
+                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat") && value &&
+                        linuxRuntime.isBootstrapped() && linuxRuntime.isProotDistroInstalled("ubuntu")) {
+                        startForegroundService()
+                    }
                     result.success(true)
                 }
 
@@ -479,6 +489,10 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "startUbuntuSshd" -> {
+                    // 启动前台服务：sshd 必须在 service 持有下才能存活
+                    if (linuxRuntime.isBootstrapped() && linuxRuntime.isProotDistroInstalled("ubuntu")) {
+                        startForegroundService()
+                    }
                     thread {
                         val ok = if (chrootRuntime.hasRoot()) {
                             chrootRuntime.startUbuntuSshd()
@@ -663,6 +677,34 @@ class MainActivity : FlutterActivity() {
 
                 "isBatteryOptimized" -> {
                     result.success(isBatteryOptimized())
+                }
+
+                "canDrawOverlays" -> {
+                    result.success(android.provider.Settings.canDrawOverlays(this))
+                }
+
+                // 调试入口：直接显示 / 隐藏保活悬浮窗（用于 adb 验证）
+                "__showKeepAlive" -> {
+                    if (android.provider.Settings.canDrawOverlays(this)) {
+                        com.orailnoor.droiddesk.service.KeepAliveFloat.show(this)
+                        startForegroundService()
+                        result.success(true)
+                    } else {
+                        result.error("NO_OVERLAY_PERMISSION", "Need SYSTEM_ALERT_WINDOW", null)
+                    }
+                }
+                "__hideKeepAlive" -> {
+                    com.orailnoor.droiddesk.service.KeepAliveFloat.dismiss()
+                    result.success(true)
+                }
+
+                "requestOverlayPermission" -> {
+                    val intent = Intent(
+                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:$packageName")
+                    )
+                    startActivity(intent)
+                    result.success(true)
                 }
 
                 "setupBootstrap" -> {

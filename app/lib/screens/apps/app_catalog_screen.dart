@@ -43,7 +43,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     _OptionalApp(
       id: 'ubuntu_install',
       name: 'Ubuntu',
-      description: 'Download and set up Ubuntu 24.04 rootfs. Required for chroot mode.',
+      description: 'Download and set up Ubuntu 24.04 rootfs. Required for chroot mode. and "smooth network"',
       icon: Icons.cloud_download_rounded,
       color: Color(0xFFE95420),
     )
