@@ -353,7 +353,9 @@ class MainActivity : FlutterActivity() {
                             "--env PROOT_TMP_DIR=\"${filesDir.absolutePath}/tmp/proot\" " +
                             "--env PROOT_LOADER=\"${linuxRuntime.prefixPath}/libexec/proot/loader\" " +
                             "--env PROOT_LOADER_32=\"${linuxRuntime.prefixPath}/libexec/proot/loader32\" " +
-                            "-- /bin/bash --login\n"
+                            // -i 强制交互式 shell，让 ~/.bashrc 顶部 PS1 检查通过并加载
+                            // -l 走 login 流程：读取 /etc/profile → ~/.profile → ~/.bashrc
+                            "-- /bin/bash -i -l\n"
                         )
                         Log.i(TAG, "Ubuntu cmd file written: ${cmdFile.absolutePath}")
                     }

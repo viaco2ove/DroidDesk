@@ -132,7 +132,9 @@ class DroidDeskService : Service() {
             "--env PROOT_TMP_DIR=\"$tmpDirPath/proot\" " +
             "--env PROOT_LOADER=\"$prefixPath/libexec/proot/loader\" " +
             "--env PROOT_LOADER_32=\"$prefixPath/libexec/proot/loader32\" " +
-            "-- /bin/bash --login"
+            // ssh 登录会读 ~/.bashrc，但 bash --login 默认不会读，只有交互式 non-login 才会
+            // 用 -i 显式让 bash 当作交互式 shell + source .bashrc
+            "-- /bin/bash -i -l"
         )
         Log.i(TAG, "Daemon: Ubuntu session command file written")
 
@@ -151,7 +153,7 @@ class DroidDeskService : Service() {
             "--env PROOT_TMP_DIR=\"$tmpDirPath/proot\" " +
             "--env PROOT_LOADER=\"$prefixPath/libexec/proot/loader\" " +
             "--env PROOT_LOADER_32=\"$prefixPath/libexec/proot/loader32\" " +
-            "-- /bin/bash --login"
+            "-- /bin/bash -i -l"
         )
             .redirectErrorStream(true)
             .start()
