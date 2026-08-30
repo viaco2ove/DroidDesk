@@ -202,6 +202,10 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
 
+                      // ── Ubuntu Status (real-time) ──
+                      const SizedBox(height: 10),
+                      _UbuntuStatusCard(),
+
                       if (!state.hasRoot &&
                           state.optionalApps['proot_debian'] == true) ...[
                         const SizedBox(height: 10),
@@ -701,6 +705,124 @@ class _TerminalSheetState extends State<_TerminalSheet> {
         return distro;
     }
   }
+}
+
+// ── Ubuntu Status Widget ──
+
+class _UbuntuStatusCard extends StatefulWidget {
+  @override
+  State<_UbuntuStatusCard> createState() => _UbuntuStatusCardState();
+}
+
+class _UbuntuStatusCardState extends State<_UbuntuStatusCard> {
+  bool _ubuntuRunning = false;
+  bool _sshdRunning = false;
+  int _sshPort = 22;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _loading = true);
+    try {
+      final s = await DroidDeskPlatform.getUbuntuStatus();
+      if (mounted) {
+        setState(() {
+          _ubuntuRunning = s['ubuntuRunning'] as bool? ?? false;
+          _sshdRunning = s['sshdRunning'] as bool? ?? false;
+          _sshPort = s['sshPort'] as int? ?? 22;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: _refresh,
+      child: Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFF1A0A00), Color(0xFF2D1200)],
+          ),
+          borderRadius: BorderRadius.circular(DroidTheme.radiusMd),
+          border: Border.all(color: const Color(0xFFE95420).withValues(alpha: 0.3)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.terminal_rounded, color: Color(0xFFE95420), size: 20),
+                const SizedBox(width: 8),
+                Text('Ubuntu Runtime', style: DroidTheme.headingSm),
+                const Spacer(),
+                if (_loading)
+                  const SizedBox(width: 14, height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFE95420)))
+                else
+                  Icon(Icons.refresh_rounded, color: DroidTheme.textDim, size: 18),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(children: [
+              _dot(_ubuntuRunning),
+              const SizedBox(width: 8),
+              Text('Ubuntu', style: DroidTheme.bodySm),
+              const Spacer(),
+              Text(_ubuntuRunning ? 'running' : 'stopped',
+                  style: DroidTheme.bodySm.copyWith(
+                    color: _ubuntuRunning ? DroidTheme.accent : DroidTheme.textDim,
+                    fontWeight: FontWeight.w600,
+                  )),
+            ]),
+            const SizedBox(height: 6),
+            Row(children: [
+              _dot(_sshdRunning),
+              const SizedBox(width: 8),
+              Text('OpenSSH', style: DroidTheme.bodySm),
+              const Spacer(),
+              Text(_sshdRunning ? 'running (port $_sshPort)' : 'stopped',
+                  style: DroidTheme.bodySm.copyWith(
+                    color: _sshdRunning ? DroidTheme.accent : DroidTheme.textDim,
+                    fontWeight: FontWeight.w600,
+                  )),
+            ]),
+            if (_sshdRunning) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: DroidTheme.accent.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: DroidTheme.accent.withValues(alpha: 0.2)),
+                ),
+                child: Text('ssh root@<device-ip> -p $_sshPort',
+                    style: DroidTheme.monoSm.copyWith(color: DroidTheme.accent, fontSize: 11)),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _dot(bool on) => Container(
+      width: 8, height: 8,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: on ? DroidTheme.accent : DroidTheme.textDim,
+        boxShadow: on ? [BoxShadow(color: DroidTheme.accent.withValues(alpha: 0.5), blurRadius: 4)] : null,
+      ),
+    );
 }
 
 // ── Small Action Card widget ──

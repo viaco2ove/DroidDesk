@@ -459,19 +459,22 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "getUbuntuStatus" -> {
-                    val status = if (chrootRuntime.hasRoot()) {
-                        mapOf(
-                            "ubuntuRunning" to chrootRuntime.isChrootRunning(),
-                            "sshdRunning" to chrootRuntime.isSshdRunning(),
-                            "sshPort" to getSshPortFromPrefs(),
-                        )
+                    val ubuntuRunning = if (chrootRuntime.hasRoot()) {
+                        chrootRuntime.isChrootRunning()
                     } else {
-                        mapOf(
-                            "ubuntuRunning" to linuxRuntime.isUbuntuProotRunning(),
-                            "sshdRunning" to linuxRuntime.isUbuntuSshdRunning(),
-                            "sshPort" to getSshPortFromPrefs(),
-                        )
+                        linuxRuntime.isUbuntuProotRunning()
                     }
+                    val sshdRunning = if (chrootRuntime.hasRoot()) {
+                        chrootRuntime.isSshdRunning()
+                    } else {
+                        linuxRuntime.isUbuntuSshdRunning()
+                    }
+                    val status = mapOf(
+                        "ubuntuRunning" to ubuntuRunning,
+                        "sshdRunning" to sshdRunning,
+                        "sshPort" to getSshPortFromPrefs(),
+                    )
+                    Log.d(TAG, "getUbuntuStatus: ubuntuRunning=$ubuntuRunning sshdRunning=$sshdRunning")
                     result.success(status)
                 }
 
