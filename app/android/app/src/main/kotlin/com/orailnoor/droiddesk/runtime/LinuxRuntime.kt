@@ -1908,7 +1908,9 @@ class LinuxRuntime(private val context: Context) {
     }
 
     /**
-     * 在容器内写默认 /etc/supervisor/conf.d/droiddesk.conf，管理 sshd 和 nginx
+     * 在容器内写默认 /etc/supervisor/conf.d/droiddesk.conf，管理 sshd
+     * 注意：nginx 不再由 supervisor 管理，因为在 proot 环境里无法绑定端口。
+     * 如需 nginx，请手动在容器内启动（apt-get install nginx 后手动 nginx 命令）。
      */
     private fun writeSupervisorConf() {
         try {
@@ -1929,16 +1931,12 @@ startretries=10
 stopsignal=TERM
 stopwaitsecs=10
 priority=10
-
-[program:nginx]
-command=/usr/sbin/nginx -g "daemon off;"
-autostart=true
-autorestart=true
-startsecs=3
-startretries=5
-stopsignal=QUIT
-stopwaitsecs=10
-priority=20
+stdout_logfile=/var/log/supervisor/sshd.log
+stdout_logfile_maxbytes=5MB
+stdout_logfile_backups=2
+stderr_logfile=/var/log/supervisor/sshd.err
+stderr_logfile_maxbytes=5MB
+stderr_logfile_backups=2
 """.trimIndent()
             val confEscaped = conf.replace("'", "'\\''")
             val cmd = "proot-distro $baseArgs sh -c '" +
