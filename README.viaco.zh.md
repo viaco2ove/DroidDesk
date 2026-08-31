@@ -127,6 +127,18 @@
 
 ---
 
+## 集成并支持 Ubuntu supervisor 守护进程管理
+
+- 在 DroidDeskService 中添加 supervisor 健康监控定时任务
+- 支持 supervisorWithUbuntu 开关，优先启动 supervisor 管理 sshd 和 nginx
+- LinuxRuntime 增加 supervisor 相关方法，包括安装、启动、停止及状态检测
+- supervisor 安装流程通过 apt-get 实现，自动写入默认配置管理 sshd/nginx
+- MainActivity 增加对 supervisorWithUbuntu 配置开关的支持及安装接口
+- Flutter 端新增 supervisor 状态检测与安装功能及安装进度回调
+- UbuntuConsoleScreen 添加 supervisor 相关 UI 控件及安装引导和状态刷新
+- 关闭 supervisor 时自动停止旧 sshd 以避免端口冲突，开启时由 supervisor 管理子进程
+- 优化服务启动逻辑，确保 supervisor 与 pm2 守护进程不冲突，提升稳定性
+
 ## 🔧 代码优化
 
 ### 重构内容
