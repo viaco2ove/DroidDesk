@@ -98,11 +98,23 @@ class DroidDeskService : Service() {
                         Log.i(TAG, "Daemon active, starting sshd...")
                         runtime.startUbuntuSshd()
                     }
+                    // pm2WithUbuntu=true 时确保 pm2 守护进程在跑
+                    if (sp.getBoolean("pm2WithUbuntu", false)) {
+                        if (!runtime.isUbuntuPm2Running()) {
+                            Log.i(TAG, "Daemon active, starting pm2...")
+                            runtime.startUbuntuPm2()
+                        } else {
+                            Log.i(TAG, "Daemon active, pm2 already running")
+                        }
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to restore Ubuntu session: ${e.message}")
                 }
             }
         }
+
+        // pm2 健康监控：每 60 秒检查 pm2 daemon，死了就重启
+        schedulePm2Watchdog(sp)
 
         return START_STICKY
     }
@@ -162,9 +174,39 @@ class DroidDeskService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // pm2 健康监控：定时检查 + 自动重启
+    private val pm2WatchdogRunnable = object : Runnable {
+        override fun run() {
+            val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
+            // 仅在用户开启 pm2WithUbuntu 时才监控
+            if (sp.getBoolean("pm2WithUbuntu", false)) {
+                try {
+                    val runtime = LinuxRuntime.getInstance(applicationContext)
+                    if (!runtime.isUbuntuPm2Running()) {
+                        Log.w(TAG, "pm2 watchdog: daemon dead, restarting...")
+                        runtime.startUbuntuPm2()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "pm2 watchdog failed: ${e.message}")
+                }
+            }
+            // 60 秒后再调度
+            workerHandler?.postDelayed(this, 60_000)
+        }
+    }
+
+    private fun schedulePm2Watchdog(sp: android.content.SharedPreferences) {
+        if (sp.getBoolean("pm2WithUbuntu", false)) {
+            workerHandler?.removeCallbacks(pm2WatchdogRunnable)
+            workerHandler?.postDelayed(pm2WatchdogRunnable, 60_000)
+            Log.i(TAG, "pm2 watchdog scheduled")
+        }
+    }
+
     override fun onDestroy() {
         KeepAliveFloat.dismiss()
         releaseWakeLock()
+        workerHandler?.removeCallbacks(pm2WatchdogRunnable)
         workerThread?.quitSafely()
         workerThread = null
         workerHandler = null

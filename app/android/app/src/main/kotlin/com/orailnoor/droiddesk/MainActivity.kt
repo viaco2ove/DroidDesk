@@ -384,6 +384,7 @@ class MainActivity : FlutterActivity() {
                         "boot" to sp.getBoolean("boot", false),
                         "sshWithUbuntu" to sp.getBoolean("sshWithUbuntu", false),
                         "keepAliveFloat" to sp.getBoolean("keepAliveFloat", true),
+                        "pm2WithUbuntu" to sp.getBoolean("pm2WithUbuntu", false),
                     )
                     result.success(settings)
                 }
@@ -394,8 +395,8 @@ class MainActivity : FlutterActivity() {
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit().putBoolean(key, value).apply()
                     applyUbuntuSettings(sp)
-                    // 守护 / sshWithUbuntu / keepAliveFloat 开关开启时，确保前台服务在线以保护子进程
-                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat") && value) {
+                    // 守护 / sshWithUbuntu / keepAliveFloat / pm2WithUbuntu 开关开启时，确保前台服务在线以保护子进程
+                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat" || key == "pm2WithUbuntu") && value) {
                         startForegroundService()
                     }
                     result.success(true)

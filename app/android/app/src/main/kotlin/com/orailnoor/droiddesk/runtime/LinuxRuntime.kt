@@ -78,6 +78,8 @@ class LinuxRuntime(private val context: Context) {
         // 独立的 sshd 长期会话（在 Ubuntu 内部运行 sshd 直到显式 stop）。
         // 与桌面 session 分开，避免争夺 sessionProcess。
         @Volatile private var sshdProcess: Process? = null
+        // pm2 守护进程长期会话（持有 proot 容器，确保 pm2 daemon 不被 Android 杀掉）
+        @Volatile private var pm2Process: Process? = null
     }
 
     @Volatile private var activeCommandProcess: Process? = null
@@ -1675,6 +1677,136 @@ class LinuxRuntime(private val context: Context) {
     }
 
     fun isUbuntuSshdManaged(): Boolean = sshdProcess?.isAlive == true
+
+    // ── pm2 daemon (Node.js process manager) ──
+    //
+    // pm2 守护进程需要长期 proot 容器才能稳定运行。SSH 客户端连上后 pm2 resurrect
+    // 即可恢复保存的进程列表；如果 pm2 daemon 被系统杀掉，service 会重新启动
+    // 容器 + resurrect 来保活。
+
+    /**
+     * 检查 pm2 守护进程是否存活：在容器内跑 `pm2 ping`。
+     */
+    fun isUbuntuPm2Running(): Boolean {
+        if (pm2Process?.isAlive == true) return true
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            val innerCmd = "pm2 ping 2>&1"
+            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
+            val proc = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply {
+                    environment().apply {
+                        put("PREFIX", prefixDir.absolutePath)
+                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
+                        put("TMPDIR", tmpDir.absolutePath)
+                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+                        put("PYTHONHOME", prefixDir.absolutePath)
+                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
+                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
+                        put("TERMUX__PREFIX", prefixDir.absolutePath)
+                        put("TERMUX__HOME", "${baseDir.absolutePath}/home")
+                        put("TERMUX_VERSION", "0.119.0")
+                    }
+                }
+                .start()
+            val finished = proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                proc.destroyForcibly()
+                Log.d(TAG, "isUbuntuPm2Running: pm2 ping timeout")
+                return false
+            }
+            val out = proc.inputStream.bufferedReader().readText()
+            val ok = out.contains("Process manager")
+            Log.d(TAG, "isUbuntuPm2Running: ok=$ok output=${out.take(120)}")
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "isUbuntuPm2Running failed: ${e.javaClass.simpleName} ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 启动 pm2 守护进程：单独开一个 proot 容器跑 `pm2 resurrect`，
+     * 容器保持运行直到显式 stop。幂等：已运行则直接返回 true。
+     */
+    fun startUbuntuPm2(): Boolean {
+        if (pm2Process?.isAlive == true) {
+            Log.i(TAG, "startUbuntuPm2: already running")
+            return true
+        }
+        stopUbuntuPm2()
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            // exec bash -i -l 让 bash 加载 .bashrc（其中可能有用户自己的 pm2 配置），
+            // 之后 exec tail -f /dev/null 保持容器不退出
+            val innerCmd = "if ! pgrep -f 'pm2 God' > /dev/null; then pm2 resurrect 2>/dev/null || true; fi; exec tail -f /dev/null"
+            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
+            Log.i(TAG, "startUbuntuPm2: $fullCmd")
+            pm2Process = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply {
+                    environment().apply {
+                        put("PREFIX", prefixDir.absolutePath)
+                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
+                        put("TMPDIR", tmpDir.absolutePath)
+                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+                        put("PYTHONHOME", prefixDir.absolutePath)
+                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
+                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
+                        put("TERMUX__PREFIX", prefixDir.absolutePath)
+                        put("TERMUX__HOME", "${baseDir.absolutePath}/home")
+                        put("TERMUX_VERSION", "0.119.0")
+                    }
+                }
+                .start()
+            // 读取输出日志
+            Thread {
+                try {
+                    pm2Process!!.inputStream.bufferedReader().forEachLine { line ->
+                        Log.i(TAG, "pm2-host: $line")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "pm2 host stdout reader: ${e.message}")
+                }
+            }.start()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startUbuntuPm2 failed", e)
+            pm2Process = null
+            false
+        }
+    }
+
+    fun stopUbuntuPm2() {
+        val p = pm2Process ?: return
+        try {
+            if (p.isAlive) {
+                p.destroy()
+                if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "stopUbuntuPm2: ${e.message}")
+        } finally {
+            pm2Process = null
+        }
+    }
+
+    fun isUbuntuPm2Managed(): Boolean = pm2Process?.isAlive == true
 
     fun installOptionalApp(
         appId: String,

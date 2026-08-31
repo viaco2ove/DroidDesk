@@ -18,6 +18,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   bool _sshWithUbuntu = false;
   bool _sshInstalled = false;
   bool _keepAliveFloat = true;
+  bool _pm2WithUbuntu = false;
   bool _canDrawOverlays = false;
   bool _loading = true;
 
@@ -119,6 +120,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
         _sshWithUbuntu = settings['sshWithUbuntu'] ?? false;
         _sshInstalled = ssh;
         _keepAliveFloat = settings['keepAliveFloat'] ?? true;
+        _pm2WithUbuntu = settings['pm2WithUbuntu'] ?? false;
         _canDrawOverlays = canFloat;
         _userCtrl.text = creds['user'] ?? '';
         _passCtrl.text = creds['password'] ?? '';
@@ -320,6 +322,27 @@ const SizedBox(height: 16),
                         subtitle: Text(_canDrawOverlays
                             ? 'Show floating icon to prevent background freezing'
                             : '需要「显示悬浮窗」权限'),
+                        activeColor: const Color(0xFFE95420),
+                      ),
+                      const Divider(height: 1, color: DroidTheme.surfaceBorder),
+                      SwitchListTile(
+                        value: _pm2WithUbuntu,
+                        onChanged: (v) async {
+                          if (mounted) setState(() => _pm2WithUbuntu = v);
+                          await _toggle('pm2WithUbuntu', v);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(v
+                                    ? 'pm2 自动保活已开启（service 会负责 resurrect）'
+                                    : 'pm2 自动保活已关闭'),
+                              ),
+                            );
+                          }
+                        },
+                        title: const Text('Auto-resurrect pm2'),
+                        subtitle: const Text(
+                            'Service 会在 pm2 守护进程挂掉时自动重启'),
                         activeColor: const Color(0xFFE95420),
                       ),
                     ],
