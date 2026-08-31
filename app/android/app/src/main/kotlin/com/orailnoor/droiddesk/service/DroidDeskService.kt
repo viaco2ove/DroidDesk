@@ -91,8 +91,10 @@ class DroidDeskService : Service() {
                         Log.i(TAG, "Daemon active, restoring Ubuntu session...")
                         restoreUbuntuSession(runtime)
                     }
-                    // sshWithUbuntu=true 时确保 sshd 也在跑
+                    // sshWithUbuntu=true 且 supervisor 未开启时，确保 sshd 也在跑
+                    // （supervisor 开启时由 supervisor 内部的 [program:sshd] 管理 sshd）
                     if (sp.getBoolean("sshWithUbuntu", false) &&
+                        !sp.getBoolean("supervisorWithUbuntu", false) &&
                         runtime.isUbuntuSshInstalled() &&
                         !runtime.isUbuntuSshdRunning()) {
                         Log.i(TAG, "Daemon active, starting sshd...")
@@ -115,6 +117,23 @@ class DroidDeskService : Service() {
 
         // pm2 健康监控：每 60 秒检查 pm2 daemon，死了就重启
         schedulePm2Watchdog(sp)
+        // supervisor 健康监控：每 60 秒检查 supervisord，死了就重启
+        scheduleSupervisorWatchdog(sp)
+
+        // supervisor 开启时优先启动（supervisor 内部管 sshd/nginx，所以传统 sshd 启动可以省略）
+        if (sp.getBoolean("supervisorWithUbuntu", false)) {
+            workerHandler?.post {
+                try {
+                    val runtime = LinuxRuntime.getInstance(this)
+                    if (!runtime.isUbuntuSupervisorRunning()) {
+                        Log.i(TAG, "Supervisor enabled, starting...")
+                        runtime.startUbuntuSupervisor()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start supervisor: ${e.message}")
+                }
+            }
+        }
 
         return START_STICKY
     }
@@ -203,10 +222,38 @@ class DroidDeskService : Service() {
         }
     }
 
+    // supervisor 健康监控
+    private val supervisorWatchdogRunnable = object : Runnable {
+        override fun run() {
+            val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
+            if (sp.getBoolean("supervisorWithUbuntu", false)) {
+                try {
+                    val runtime = LinuxRuntime.getInstance(applicationContext)
+                    if (!runtime.isUbuntuSupervisorRunning()) {
+                        Log.w(TAG, "supervisor watchdog: daemon dead, restarting...")
+                        runtime.startUbuntuSupervisor()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "supervisor watchdog failed: ${e.message}")
+                }
+            }
+            workerHandler?.postDelayed(this, 60_000)
+        }
+    }
+
+    private fun scheduleSupervisorWatchdog(sp: android.content.SharedPreferences) {
+        if (sp.getBoolean("supervisorWithUbuntu", false)) {
+            workerHandler?.removeCallbacks(supervisorWatchdogRunnable)
+            workerHandler?.postDelayed(supervisorWatchdogRunnable, 60_000)
+            Log.i(TAG, "supervisor watchdog scheduled")
+        }
+    }
+
     override fun onDestroy() {
         KeepAliveFloat.dismiss()
         releaseWakeLock()
         workerHandler?.removeCallbacks(pm2WatchdogRunnable)
+        workerHandler?.removeCallbacks(supervisorWatchdogRunnable)
         workerThread?.quitSafely()
         workerThread = null
         workerHandler = null

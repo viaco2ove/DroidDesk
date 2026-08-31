@@ -13,6 +13,7 @@ class DroidDeskPlatform {
   static Function(double progress, String status)? onExtractProgress;
   static Function(double progress, String status)? onInstallProgress;
   static Function(double progress, String status)? onOptionalInstallProgress;
+  static Function(double progress, String status)? onSupervisorInstallProgress;
   static Function(String text)? onTerminalOutput;
 
   /// Initialize platform channel listeners
@@ -47,6 +48,13 @@ class DroidDeskPlatform {
         case 'onOptionalInstallProgress':
           final args = call.arguments as Map;
           onOptionalInstallProgress?.call(
+            (args['progress'] as num).toDouble(),
+            args['status'] as String,
+          );
+          break;
+        case 'onSupervisorInstallProgress':
+          final args = call.arguments as Map;
+          onSupervisorInstallProgress?.call(
             (args['progress'] as num).toDouble(),
             args['status'] as String,
           );
@@ -149,6 +157,18 @@ class DroidDeskPlatform {
 
   static Future<void> requestOverlayPermission() async {
     await _channel.invokeMethod('requestOverlayPermission');
+  }
+
+  // ── Supervisor ──
+
+  static Future<bool> isSupervisorInstalled() async {
+    final r = await _channel.invokeMethod<bool>('isSupervisorInstalled');
+    return r ?? false;
+  }
+
+  static Future<bool> installSupervisor() async {
+    final r = await _channel.invokeMethod<bool>('installSupervisor');
+    return r ?? false;
   }
 
   static Future<Map<String, String>> getUbuntuCredentials() async {

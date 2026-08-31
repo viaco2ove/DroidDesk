@@ -80,6 +80,8 @@ class LinuxRuntime(private val context: Context) {
         @Volatile private var sshdProcess: Process? = null
         // pm2 守护进程长期会话（持有 proot 容器，确保 pm2 daemon 不被 Android 杀掉）
         @Volatile private var pm2Process: Process? = null
+        // supervisor 守护进程长期会话（持有 proot 容器，管理 sshd/nginx 等子进程）
+        @Volatile private var supervisorProcess: Process? = null
     }
 
     @Volatile private var activeCommandProcess: Process? = null
@@ -1807,6 +1809,263 @@ class LinuxRuntime(private val context: Context) {
     }
 
     fun isUbuntuPm2Managed(): Boolean = pm2Process?.isAlive == true
+
+    // ── Supervisor (进程管理器) ──
+    //
+    // supervisor 在容器内启动后，会自动管理 /etc/supervisor/conf.d/*.conf 中定义的
+    // 子进程（sshd、nginx 等）。它处理单个进程崩溃后的重启，但解决不了容器本身被
+    // Android 冻结/杀掉的问题——所以 service 仍然负责"supervisord 死了整个容器重启"。
+
+    fun isUbuntuSupervisorInstalled(): Boolean {
+        // 直接在容器内跑命令检测，避免依赖 proot-distro 启动
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            val proc = ProcessBuilder("sh", "-c",
+                "proot-distro $baseArgs sh -c 'test -x /usr/bin/supervisord'")
+                .apply {
+                    environment().apply {
+                        put("PREFIX", prefixDir.absolutePath)
+                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
+                        put("TMPDIR", tmpDir.absolutePath)
+                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+                        put("PYTHONHOME", prefixDir.absolutePath)
+                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
+                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
+                        put("TERMUX__PREFIX", prefixDir.absolutePath)
+                        put("TERMUX__HOME", "${baseDir.absolutePath}/home")
+                        put("TERMUX_VERSION", "0.119.0")
+                    }
+                }
+                .start()
+            proc.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            val ok = proc.exitValue() == 0
+            Log.d(TAG, "isUbuntuSupervisorInstalled: $ok")
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "isUbuntuSupervisorInstalled failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 安装 supervisor（在 Ubuntu 容器内 apt install）
+     * 返回 true 表示安装成功或已安装
+     */
+    fun installUbuntuSupervisor(onProgress: ((Double, String) -> Unit)? = null): Boolean {
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            // 先 update，再 install
+            val updateCmd = "proot-distro $baseArgs apt-get update"
+            val installCmd = "proot-distro $baseArgs DEBIAN_FRONTEND=noninteractive apt-get install -y supervisor"
+            Log.i(TAG, "installUbuntuSupervisor: $installCmd")
+            val p1 = ProcessBuilder("sh", "-c", updateCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            // 流式读取输出
+            Thread {
+                p1.inputStream.bufferedReader().forEachLine { line ->
+                    Log.d(TAG, "supervisor-install update: $line")
+                    onProgress?.invoke(0.3, line)
+                }
+            }.start()
+            p1.waitFor(180, java.util.concurrent.TimeUnit.SECONDS)
+
+            val p2 = ProcessBuilder("sh", "-c", installCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            Thread {
+                p2.inputStream.bufferedReader().forEachLine { line ->
+                    Log.d(TAG, "supervisor-install: $line")
+                    onProgress?.invoke(0.6, line)
+                }
+            }.start()
+            val ok = p2.waitFor(300, java.util.concurrent.TimeUnit.SECONDS) && p2.exitValue() == 0
+            if (ok) {
+                // 写默认 droiddesk.conf：管理 sshd + nginx（pm2 由 service 直接管）
+                writeSupervisorConf()
+                onProgress?.invoke(1.0, "supervisor installed")
+            }
+            Log.i(TAG, "installUbuntuSupervisor ok=$ok")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "installUbuntuSupervisor failed", e)
+            false
+        }
+    }
+
+    /**
+     * 在容器内写默认 /etc/supervisor/conf.d/droiddesk.conf，管理 sshd 和 nginx
+     */
+    private fun writeSupervisorConf() {
+        try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            val conf = """
+[program:sshd]
+command=/usr/sbin/sshd -D -e
+autostart=true
+autorestart=true
+startsecs=5
+startretries=10
+stopsignal=TERM
+stopwaitsecs=10
+priority=10
+
+[program:nginx]
+command=/usr/sbin/nginx -g "daemon off;"
+autostart=true
+autorestart=true
+startsecs=3
+startretries=5
+stopsignal=QUIT
+stopwaitsecs=10
+priority=20
+""".trimIndent()
+            val confEscaped = conf.replace("'", "'\\''")
+            val cmd = "proot-distro $baseArgs sh -c '" +
+                    "mkdir -p /etc/supervisor/conf.d /var/log/supervisor && " +
+                    "cat > /etc/supervisor/conf.d/droiddesk.conf <<'CONF'\n$conf\nCONF\n'"
+            val p = ProcessBuilder("sh", "-c", cmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
+            Log.i(TAG, "writeSupervisorConf done")
+        } catch (e: Exception) {
+            Log.e(TAG, "writeSupervisorConf failed", e)
+        }
+    }
+
+    /**
+     * 检查 supervisor 是否在跑：容器内 supervisorctl status
+     */
+    fun isUbuntuSupervisorRunning(): Boolean {
+        if (supervisorProcess?.isAlive == true) return true
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            val cmd = "proot-distro $baseArgs supervisorctl status 2>&1"
+            val proc = ProcessBuilder("sh", "-c", cmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            proc.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            val out = proc.inputStream.bufferedReader().readText()
+            // 至少能列出程序就算 ok（不依赖具体服务在跑）
+            val ok = out.contains("RUNNING") || out.contains("STARTING") || out.contains("STOPPED")
+            Log.d(TAG, "isUbuntuSupervisorRunning: ok=$ok out=${out.take(200)}")
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "isUbuntuSupervisorRunning failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 启动 supervisor：单独开一个 proot 容器跑 supervisord，
+     * 容器保持运行直到显式 stop。幂等。
+     */
+    fun startUbuntuSupervisor(): Boolean {
+        if (supervisorProcess?.isAlive == true) {
+            Log.i(TAG, "startUbuntuSupervisor: already running")
+            return true
+        }
+        stopUbuntuSupervisor()
+        return try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val baseArgs = "login ubuntu " +
+                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+            // 启动 supervisor 前先确保配置文件存在
+            writeSupervisorConf()
+            // supervisord -n 前台运行；exec tail 保持容器
+            val innerCmd = "test -f /etc/supervisor/conf.d/droiddesk.conf && /usr/bin/supervisord -c /etc/supervisor/supervisord.conf -n || { echo 'droiddesk.conf missing'; exec tail -f /dev/null; }"
+            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
+            Log.i(TAG, "startUbuntuSupervisor: $fullCmd")
+            supervisorProcess = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            Thread {
+                try {
+                    supervisorProcess!!.inputStream.bufferedReader().forEachLine { line ->
+                        Log.i(TAG, "supervisor: $line")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "supervisor stdout reader: ${e.message}")
+                }
+            }.start()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startUbuntuSupervisor failed", e)
+            supervisorProcess = null
+            false
+        }
+    }
+
+    fun stopUbuntuSupervisor() {
+        val p = supervisorProcess ?: return
+        try {
+            if (p.isAlive) {
+                p.destroy()
+                if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                    p.destroyForcibly()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "stopUbuntuSupervisor: ${e.message}")
+        } finally {
+            supervisorProcess = null
+        }
+    }
+
+    fun isUbuntuSupervisorManaged(): Boolean = supervisorProcess?.isAlive == true
+
+    /**
+     * 公共 proot 环境变量（减少代码重复）
+     */
+    private fun ProcessBuilder.commonProotEnv(): ProcessBuilder {
+        environment().apply {
+            put("PREFIX", prefixDir.absolutePath)
+            put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
+            put("TMPDIR", tmpDir.absolutePath)
+            put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+            put("PYTHONHOME", prefixDir.absolutePath)
+            put("TERMUX_APP__PACKAGE_NAME", context.packageName)
+            put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
+            put("TERMUX__PREFIX", prefixDir.absolutePath)
+            put("TERMUX__HOME", "${baseDir.absolutePath}/home")
+            put("TERMUX_VERSION", "0.119.0")
+        }
+        return this
+    }
 
     fun installOptionalApp(
         appId: String,

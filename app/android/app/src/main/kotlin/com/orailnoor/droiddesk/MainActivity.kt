@@ -385,6 +385,7 @@ class MainActivity : FlutterActivity() {
                         "sshWithUbuntu" to sp.getBoolean("sshWithUbuntu", false),
                         "keepAliveFloat" to sp.getBoolean("keepAliveFloat", true),
                         "pm2WithUbuntu" to sp.getBoolean("pm2WithUbuntu", false),
+                        "supervisorWithUbuntu" to sp.getBoolean("supervisorWithUbuntu", false),
                     )
                     result.success(settings)
                 }
@@ -395,11 +396,38 @@ class MainActivity : FlutterActivity() {
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit().putBoolean(key, value).apply()
                     applyUbuntuSettings(sp)
-                    // 守护 / sshWithUbuntu / keepAliveFloat / pm2WithUbuntu 开关开启时，确保前台服务在线以保护子进程
-                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat" || key == "pm2WithUbuntu") && value) {
+                    // 守护 / sshWithUbuntu / keepAliveFloat / pm2WithUbuntu / supervisorWithUbuntu 开关开启时，确保前台服务在线以保护子进程
+                    if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat" ||
+                        key == "pm2WithUbuntu" || key == "supervisorWithUbuntu") && value) {
                         startForegroundService()
                     }
+                    // 关闭 supervisor 时，不需要停任何东西（service 接管后会自己启动 sshd）
+                    // 开启 supervisor 时，如果旧 sshd 在跑就停掉（端口冲突）
+                    if (key == "supervisorWithUbuntu" && value) {
+                        linuxRuntime.stopUbuntuSshd()
+                    }
                     result.success(true)
+                }
+
+                "isSupervisorInstalled" -> {
+                    val installed = linuxRuntime.isUbuntuSupervisorInstalled()
+                    result.success(installed)
+                }
+
+                "installSupervisor" -> {
+                    Thread {
+                        val ok = linuxRuntime.installUbuntuSupervisor { progress, status ->
+                            runOnUiThread {
+                                flutterEngine.dartExecutor.binaryMessenger.let {
+                                    MethodChannel(it, CHANNEL).invokeMethod(
+                                        "onSupervisorInstallProgress",
+                                        mapOf("progress" to progress, "status" to status)
+                                    )
+                                }
+                            }
+                        }
+                        result.success(ok)
+                    }.start()
                 }
 
                 "getUbuntuCredentials" -> {
