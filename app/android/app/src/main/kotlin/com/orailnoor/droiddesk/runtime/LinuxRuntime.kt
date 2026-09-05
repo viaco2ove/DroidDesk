@@ -78,9 +78,7 @@ class LinuxRuntime(private val context: Context) {
         // 独立的 sshd 长期会话（在 Ubuntu 内部运行 sshd 直到显式 stop）。
         // 与桌面 session 分开，避免争夺 sessionProcess。
         @Volatile private var sshdProcess: Process? = null
-        // pm2 守护进程长期会话（持有 proot 容器，确保 pm2 daemon 不被 Android 杀掉）
-        @Volatile private var pm2Process: Process? = null
-        // supervisor 守护进程长期会话（持有 proot 容器，管理 sshd/nginx 等子进程）
+        // supervisor 守护进程长期会话（持有 proot 容器，管理 sshd 等子进程）
         @Volatile private var supervisorProcess: Process? = null
     }
 
@@ -1682,133 +1680,90 @@ class LinuxRuntime(private val context: Context) {
 
     // ── pm2 daemon (Node.js process manager) ──
     //
-    // pm2 守护进程需要长期 proot 容器才能稳定运行。SSH 客户端连上后 pm2 resurrect
-    // 即可恢复保存的进程列表；如果 pm2 daemon 被系统杀掉，service 会重新启动
-    // 容器 + resurrect 来保活。
+    // pm2 通过 inject-to-session 方式保活，与 SSH session 共用同一个 proot 容器，
+    // 避免 PID 命名空间隔离导致 SSH 里看不到 daemon。
 
     /**
-     * 检查 pm2 守护进程是否存活：在容器内跑 `pm2 ping`。
+     * 在已有 session 容器内注入 pm2 命令（短命令，不开新容器）。
+     * 通过文件锁 + pm2.pid 校验确保只拉起一个 daemon：
+     *  1. 先读 pm2.pid；如果指向真实存活进程 → 直接 ping，不做事
+     *  2. 否则：先 pm2 kill（优雅） + pkill -9（兜底），再 pm2 resurrect
+     * 不开新容器、不替换 shell，是"轻量级" RPC 调用。
      */
-    fun isUbuntuPm2Running(): Boolean {
-        if (pm2Process?.isAlive == true) return true
+    fun resurrectPm2InSession(): Boolean {
         return try {
-            val tmpDirPath = "${tmpDir.absolutePath}/proot"
-            java.io.File(tmpDirPath).mkdirs()
-            val baseArgs = "login ubuntu " +
-                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
-                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
-                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
-                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
-            val innerCmd = "pm2 ping 2>&1"
-            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
-            val proc = ProcessBuilder("sh", "-c", fullCmd)
+            val innerCmd = "PM2_PID_FILE=/root/.pm2/pm2.pid; " +
+                    // 清理：杀掉所有现存 daemon（多个实例会互抢 socket）
+                    "pkill -9 -f 'pm2 God' 2>/dev/null; pkill -9 -f 'PM2 v' 2>/dev/null; " +
+                    "pm2 kill 2>/dev/null; sleep 1; " +
+                    "rm -f /root/.pm2/pm2.pid; " +
+                    // resurrect：用 nohup 让 daemon 脱离当前 shell（proot 命令退出也不会死）
+                    "nohup pm2 resurrect >/dev/null 2>&1 </dev/null & " +
+                    "disown; sleep 2; " +
+                    "exit 0"
+            val fullCmd = buildProotLoginCmd("sh -c '$innerCmd'")
+            Log.i(TAG, "resurrectPm2InSession: $fullCmd")
+            val p = ProcessBuilder("sh", "-c", fullCmd)
                 .redirectErrorStream(true)
-                .apply {
-                    environment().apply {
-                        put("PREFIX", prefixDir.absolutePath)
-                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
-                        put("TMPDIR", tmpDir.absolutePath)
-                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
-                        put("PYTHONHOME", prefixDir.absolutePath)
-                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
-                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
-                        put("TERMUX__PREFIX", prefixDir.absolutePath)
-                        put("TERMUX__HOME", "${baseDir.absolutePath}/home")
-                        put("TERMUX_VERSION", "0.119.0")
-                    }
-                }
+                .apply { commonProotEnv() }
                 .start()
-            val finished = proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-            if (!finished) {
-                proc.destroyForcibly()
-                Log.d(TAG, "isUbuntuPm2Running: pm2 ping timeout")
-                return false
-            }
-            val out = proc.inputStream.bufferedReader().readText()
-            val ok = out.contains("Process manager")
-            Log.d(TAG, "isUbuntuPm2Running: ok=$ok output=${out.take(120)}")
-            ok
+            val finished = p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) p.destroyForcibly()
+            val out = p.inputStream.bufferedReader().readText()
+            Log.i(TAG, "resurrectPm2InSession done: ${out.take(200)}")
+            finished
         } catch (e: Exception) {
-            Log.w(TAG, "isUbuntuPm2Running failed: ${e.javaClass.simpleName} ${e.message}")
+            Log.e(TAG, "resurrectPm2InSession failed", e)
             false
         }
     }
 
+    private fun buildProotLoginCmd(innerCmd: String): String {
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        return "proot-distro login ubuntu " +
+                "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" " +
+                "-- $innerCmd"
+    }
+
     /**
-     * 启动 pm2 守护进程：单独开一个 proot 容器跑 `pm2 resurrect`，
-     * 容器保持运行直到显式 stop。幂等：已运行则直接返回 true。
+     * 检查容器内 pm2 daemon 是否存活（通过 pgrep "pm2 God" 判断）。
      */
-    fun startUbuntuPm2(): Boolean {
-        if (pm2Process?.isAlive == true) {
-            Log.i(TAG, "startUbuntuPm2: already running")
-            return true
-        }
-        stopUbuntuPm2()
+    fun isUbuntuPm2Running(): Boolean {
         return try {
-            val tmpDirPath = "${tmpDir.absolutePath}/proot"
-            java.io.File(tmpDirPath).mkdirs()
-            val baseArgs = "login ubuntu " +
-                    "--bind \"${tmpDir.absolutePath}:/tmp\" " +
-                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
-                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
-                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
-            // exec bash -i -l 让 bash 加载 .bashrc（其中可能有用户自己的 pm2 配置），
-            // 之后 exec tail -f /dev/null 保持容器不退出
-            val innerCmd = "if ! pgrep -f 'pm2 God' > /dev/null; then pm2 resurrect 2>/dev/null || true; fi; exec tail -f /dev/null"
-            val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
-            Log.i(TAG, "startUbuntuPm2: $fullCmd")
-            pm2Process = ProcessBuilder("sh", "-c", fullCmd)
+            // 用 pm2 ping 检测 daemon（pgrep 在容器外看不到进程，且残留 PID 文件会误判）
+            // pm2 ping 即使 daemon 没跑也能成功启动一个临时 daemon，所以要同时检查是否有进程列表
+            // 更可靠：用 pm2 jlist 检查 json 数组是否非空（daemon 活着+有进程）
+            val fullCmd = buildProotLoginCmd("pm2 ping 2>/dev/null && echo alive || echo dead")
+            val p = ProcessBuilder("sh", "-c", fullCmd)
                 .redirectErrorStream(true)
-                .apply {
-                    environment().apply {
-                        put("PREFIX", prefixDir.absolutePath)
-                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
-                        put("TMPDIR", tmpDir.absolutePath)
-                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
-                        put("PYTHONHOME", prefixDir.absolutePath)
-                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
-                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
-                        put("TERMUX__PREFIX", prefixDir.absolutePath)
-                        put("TERMUX__HOME", "${baseDir.absolutePath}/home")
-                        put("TERMUX_VERSION", "0.119.0")
-                    }
-                }
+                .apply { commonProotEnv() }
                 .start()
-            // 读取输出日志
-            Thread {
-                try {
-                    pm2Process!!.inputStream.bufferedReader().forEachLine { line ->
-                        Log.i(TAG, "pm2-host: $line")
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "pm2 host stdout reader: ${e.message}")
-                }
-            }.start()
-            true
+            val finished = p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) { p.destroyForcibly(); return false }
+            val out = p.inputStream.bufferedReader().readText()
+            out.contains("alive")
         } catch (e: Exception) {
-            Log.e(TAG, "startUbuntuPm2 failed", e)
-            pm2Process = null
+            Log.w(TAG, "isUbuntuPm2Running failed: ${e.message}")
             false
         }
     }
 
     fun stopUbuntuPm2() {
-        val p = pm2Process ?: return
         try {
-            if (p.isAlive) {
-                p.destroy()
-                if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
-                    p.destroyForcibly()
-                }
-            }
+            // 先 RPC 优雅 kill，再 pkill 强杀残留（防止 pm2 daemon 卡死时 RPC 失败）
+            val fullCmd = buildProotLoginCmd("pm2 kill 2>/dev/null || true; pkill -9 -f 'pm2 God' 2>/dev/null; pkill -9 -f 'PM2 v' 2>/dev/null; true")
+            val p = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
         } catch (e: Exception) {
             Log.w(TAG, "stopUbuntuPm2: ${e.message}")
-        } finally {
-            pm2Process = null
         }
     }
-
-    fun isUbuntuPm2Managed(): Boolean = pm2Process?.isAlive == true
 
     // ── Supervisor (进程管理器) ──
     //
@@ -1895,8 +1850,8 @@ class LinuxRuntime(private val context: Context) {
             }.start()
             val ok = p2.waitFor(300, java.util.concurrent.TimeUnit.SECONDS) && p2.exitValue() == 0
             if (ok) {
-                // 写默认 droiddesk.conf：管理 sshd + nginx（pm2 由 service 直接管）
-                writeSupervisorConf()
+                // 写默认 droiddesk.conf：管理 sshd（nginx 由 includeNginx 参数控制）
+                writeSupervisorConf(includeNginx = false)
                 onProgress?.invoke(1.0, "supervisor installed")
             }
             Log.i(TAG, "installUbuntuSupervisor ok=$ok")
@@ -1908,11 +1863,10 @@ class LinuxRuntime(private val context: Context) {
     }
 
     /**
-     * 在容器内写默认 /etc/supervisor/conf.d/droiddesk.conf，管理 sshd
-     * 注意：nginx 不再由 supervisor 管理，因为在 proot 环境里无法绑定端口。
-     * 如需 nginx，请手动在容器内启动（apt-get install nginx 后手动 nginx 命令）。
+     * 在容器内写 /etc/supervisor/conf.d/droiddesk.conf
+     * @param includeNginx 是否同时管理 nginx（默认 false，避免在 proot 里因端口绑定失败刷 94GB 日志）
      */
-    private fun writeSupervisorConf() {
+    private fun writeSupervisorConf(includeNginx: Boolean = false) {
         try {
             val tmpDirPath = "${tmpDir.absolutePath}/proot"
             java.io.File(tmpDirPath).mkdirs()
@@ -1921,7 +1875,7 @@ class LinuxRuntime(private val context: Context) {
                     "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
                     "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
                     "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
-            val conf = """
+            val sshdSection = """
 [program:sshd]
 command=/usr/sbin/sshd -D -e
 autostart=true
@@ -1937,17 +1891,57 @@ stdout_logfile_backups=2
 stderr_logfile=/var/log/supervisor/sshd.err
 stderr_logfile_maxbytes=5MB
 stderr_logfile_backups=2
-""".trimIndent()
-            val confEscaped = conf.replace("'", "'\\''")
-            val cmd = "proot-distro $baseArgs sh -c '" +
-                    "mkdir -p /etc/supervisor/conf.d /var/log/supervisor && " +
-                    "cat > /etc/supervisor/conf.d/droiddesk.conf <<'CONF'\n$conf\nCONF\n'"
+
+[program:pm2]
+# 启动 pm2 daemon 并保持存活：
+# 先杀掉所有现存 daemon（防多实例），然后 pm2 resurrect 起 daemon，
+# 之后用 tail -f /dev/null 保持 supervisor 看到 wrapper 永远存活（daemon 漂在容器内）
+# service 的 watchdog 负责检测 daemon 状态并触发 resurrect（如果 daemon 死掉）
+command=/bin/bash -c 'pkill -9 -f "pm2 God" 2>/dev/null; pkill -9 -f "PM2 v" 2>/dev/null; sleep 1; pm2 resurrect >/dev/null 2>&1 || true; exec tail -f /dev/null'
+autostart=true
+autorestart=true
+startsecs=10
+startretries=100
+stopsignal=TERM
+stopwaitsecs=10
+priority=5
+stdout_logfile=/var/log/supervisor/pm2.log
+stdout_logfile_maxbytes=5MB
+stdout_logfile_backups=2
+stderr_logfile=/var/log/supervisor/pm2.err
+stderr_logfile_maxbytes=5MB
+stderr_logfile_backups=2
+"""
+            val nginxSection = """
+[program:nginx]
+command=/usr/sbin/nginx -g "daemon off;"
+autostart=true
+autorestart=true
+startsecs=3
+startretries=5
+stopsignal=QUIT
+stopwaitsecs=10
+priority=20
+stdout_logfile=/var/log/supervisor/nginx.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=2
+stderr_logfile=/var/log/supervisor/nginx.err
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=2
+"""
+            val conf = sshdSection + if (includeNginx) nginxSection else ""
+            // 先写本地文件，再用 base64 编码后通过 cat 写入容器内（避免 shell 转义问题）
+            val confBytes = conf.toByteArray(Charsets.UTF_8)
+            val b64 = java.util.Base64.getEncoder().encodeToString(confBytes)
+            // 分块写入（base64 字符串可能很长），分块大小 76 字符/行（标准 base64 行宽）
+            val chunked = b64.chunked(76).joinToString("\n")
+            val cmd = "proot-distro $baseArgs sh -c \"mkdir -p /etc/supervisor/conf.d /var/log/supervisor && echo '$chunked' | base64 -d > /etc/supervisor/conf.d/droiddesk.conf && chmod 644 /etc/supervisor/conf.d/droiddesk.conf\""
             val p = ProcessBuilder("sh", "-c", cmd)
                 .redirectErrorStream(true)
                 .apply { commonProotEnv() }
                 .start()
-            p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
-            Log.i(TAG, "writeSupervisorConf done")
+            p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
+            Log.i(TAG, "writeSupervisorConf done (nginx=$includeNginx)")
         } catch (e: Exception) {
             Log.e(TAG, "writeSupervisorConf failed", e)
         }
@@ -1993,6 +1987,7 @@ stderr_logfile_backups=2
             return true
         }
         stopUbuntuSupervisor()
+        val sp = context.getSharedPreferences("ubuntu_console", android.content.Context.MODE_PRIVATE)
         return try {
             val tmpDirPath = "${tmpDir.absolutePath}/proot"
             java.io.File(tmpDirPath).mkdirs()
@@ -2001,8 +1996,8 @@ stderr_logfile_backups=2
                     "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
                     "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
                     "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
-            // 启动 supervisor 前先确保配置文件存在
-            writeSupervisorConf()
+            // 启动 supervisor 前先确保配置文件存在（nginx 由全局开关控制）
+            writeSupervisorConf(includeNginx = sp.getBoolean("supervisorNginxWithUbuntu", false))
             // supervisord -n 前台运行；exec tail 保持容器
             val innerCmd = "test -f /etc/supervisor/conf.d/droiddesk.conf && /usr/bin/supervisord -c /etc/supervisor/supervisord.conf -n || { echo 'droiddesk.conf missing'; exec tail -f /dev/null; }"
             val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""

@@ -20,6 +20,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   bool _keepAliveFloat = true;
   bool _pm2WithUbuntu = false;
   bool _supervisorWithUbuntu = false;
+  bool _supervisorNginxWithUbuntu = false;
   bool _supervisorInstalled = false;
   bool _installingSupervisor = false;
   bool _canDrawOverlays = false;
@@ -162,6 +163,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
         _keepAliveFloat = settings['keepAliveFloat'] ?? true;
         _pm2WithUbuntu = settings['pm2WithUbuntu'] ?? false;
         _supervisorWithUbuntu = settings['supervisorWithUbuntu'] ?? false;
+        _supervisorNginxWithUbuntu = settings['supervisorNginxWithUbuntu'] ?? false;
         _canDrawOverlays = canFloat;
         _userCtrl.text = creds['user'] ?? '';
         _passCtrl.text = creds['password'] ?? '';
@@ -414,6 +416,33 @@ const SizedBox(height: 16),
                                 : '点击安装 supervisor（apt-get install -y supervisor）')),
                         activeColor: const Color(0xFFE95420),
                       ),
+                      // Nginx keep-alive 子开关（仅在 supervisor 已安装时显示）
+                      if (_supervisorInstalled) ...[
+                        Padding(
+                          padding: const EdgeInsets.only(left: 16),
+                          child: SwitchListTile(
+                            value: _supervisorNginxWithUbuntu,
+                            onChanged: (v) async {
+                              if (mounted) setState(() => _supervisorNginxWithUbuntu = v);
+                              await _toggle('supervisorNginxWithUbuntu', v);
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(v
+                                        ? 'Nginx 已加入 supervisor 自动保活'
+                                        : 'Nginx 已从 supervisor 移除'),
+                                  ),
+                                );
+                              }
+                            },
+                            title: const Text('Keep-alive Nginx'),
+                            subtitle: const Text(
+                                'Nginx 由 supervisor 管理崩溃自动重启（proot 环境可能无法绑定端口）'),
+                            dense: true,
+                            activeColor: const Color(0xFFE95420),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
 

@@ -386,6 +386,7 @@ class MainActivity : FlutterActivity() {
                         "keepAliveFloat" to sp.getBoolean("keepAliveFloat", true),
                         "pm2WithUbuntu" to sp.getBoolean("pm2WithUbuntu", false),
                         "supervisorWithUbuntu" to sp.getBoolean("supervisorWithUbuntu", false),
+                        "supervisorNginxWithUbuntu" to sp.getBoolean("supervisorNginxWithUbuntu", false),
                     )
                     result.success(settings)
                 }
@@ -396,15 +397,21 @@ class MainActivity : FlutterActivity() {
                     val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
                     sp.edit().putBoolean(key, value).apply()
                     applyUbuntuSettings(sp)
-                    // 守护 / sshWithUbuntu / keepAliveFloat / pm2WithUbuntu / supervisorWithUbuntu 开关开启时，确保前台服务在线以保护子进程
+                    // 守护 / sshWithUbuntu / keepAliveFloat / pm2WithUbuntu / supervisorWithUbuntu / supervisorNginxWithUbuntu 开关开启时，确保前台服务在线以保护子进程
                     if ((key == "daemon" || key == "sshWithUbuntu" || key == "keepAliveFloat" ||
-                        key == "pm2WithUbuntu" || key == "supervisorWithUbuntu") && value) {
+                        key == "pm2WithUbuntu" || key == "supervisorWithUbuntu" ||
+                        key == "supervisorNginxWithUbuntu") && value) {
                         startForegroundService()
                     }
                     // 关闭 supervisor 时，不需要停任何东西（service 接管后会自己启动 sshd）
                     // 开启 supervisor 时，如果旧 sshd 在跑就停掉（端口冲突）
                     if (key == "supervisorWithUbuntu" && value) {
                         linuxRuntime.stopUbuntuSshd()
+                    }
+                    // supervisorNginxWithUbuntu 切换时，如果 supervisor 正在跑则重启它以重载 conf
+                    if (key == "supervisorNginxWithUbuntu" && sp.getBoolean("supervisorWithUbuntu", false)) {
+                        linuxRuntime.stopUbuntuSupervisor()
+                        linuxRuntime.startUbuntuSupervisor()
                     }
                     result.success(true)
                 }

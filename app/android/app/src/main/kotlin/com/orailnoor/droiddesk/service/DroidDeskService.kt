@@ -101,12 +101,15 @@ class DroidDeskService : Service() {
                         runtime.startUbuntuSshd()
                     }
                     // pm2WithUbuntu=true 时确保 pm2 守护进程在跑
+                    // supervisor 开启时由 supervisor 的 [program:pm2] 管理；否则由 service 通过 session 容器拉起
                     if (sp.getBoolean("pm2WithUbuntu", false)) {
-                        if (!runtime.isUbuntuPm2Running()) {
-                            Log.i(TAG, "Daemon active, starting pm2...")
-                            runtime.startUbuntuPm2()
+                        if (sp.getBoolean("supervisorWithUbuntu", false)) {
+                            Log.i(TAG, "Daemon active, pm2 managed by supervisor")
+                        } else if (!runtime.isUbuntuPm2Running()) {
+                            Log.i(TAG, "Daemon active, resurrecting pm2 in session...")
+                            runtime.resurrectPm2InSession()
                         } else {
-                            Log.i(TAG, "Daemon active, pm2 already running")
+                            Log.i(TAG, "Daemon active, pm2 daemon already alive")
                         }
                     }
                 } catch (e: Exception) {
@@ -146,6 +149,19 @@ class DroidDeskService : Service() {
         val prefixPath = runtime.prefixPath
 
         java.io.File(filesDir, "bin").mkdirs()
+        // pm2 daemon 必须和 SSH session 共用同一个 proot 容器（命名空间隔离导致独立容器无法互通）
+        // 在 session 容器启动时一次性 pm2 kill + pm2 resurrect，确保全局只有一个 daemon，
+        // .bashrc 里不再 resurrect（避免 SSH 进会话时再开一个 daemon）
+        val wantPm2 = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
+            .getBoolean("pm2WithUbuntu", false)
+        // session 容器内部命令：先清掉所有老 daemon（pkill + pm2 kill），再 resurrect
+        // 用 nohup + setsid 让 daemon 与 session shell 进程解绑，session 死了 daemon 也活着
+        val pm2Setup = if (wantPm2) {
+            "pkill -9 -f 'pm2 God' 2>/dev/null; pkill -9 -f 'PM2 v' 2>/dev/null; " +
+            "pm2 kill 2>/dev/null; sleep 1; " +
+            "nohup pm2 resurrect >/dev/null 2>&1 </dev/null & "
+        } else ""
+        val innerCmd = "${pm2Setup}exec /bin/bash -i -l"
         val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
         cmdFile.writeText(
             "export PREFIX=\"$prefixPath\"; " +
@@ -163,11 +179,9 @@ class DroidDeskService : Service() {
             "--env PROOT_TMP_DIR=\"$tmpDirPath/proot\" " +
             "--env PROOT_LOADER=\"$prefixPath/libexec/proot/loader\" " +
             "--env PROOT_LOADER_32=\"$prefixPath/libexec/proot/loader32\" " +
-            // ssh 登录会读 ~/.bashrc，但 bash --login 默认不会读，只有交互式 non-login 才会
-            // 用 -i 显式让 bash 当作交互式 shell + source .bashrc
-            "-- /bin/bash -i -l"
+            "-- sh -c '$innerCmd'"
         )
-        Log.i(TAG, "Daemon: Ubuntu session command file written")
+        Log.i(TAG, "Daemon: Ubuntu session command file written (pm2=$wantPm2)")
 
         // 启动会话进程（不等待输出）
         val process = ProcessBuilder(
@@ -184,7 +198,7 @@ class DroidDeskService : Service() {
             "--env PROOT_TMP_DIR=\"$tmpDirPath/proot\" " +
             "--env PROOT_LOADER=\"$prefixPath/libexec/proot/loader\" " +
             "--env PROOT_LOADER_32=\"$prefixPath/libexec/proot/loader32\" " +
-            "-- /bin/bash -i -l"
+            "-- sh -c '$innerCmd'"
         )
             .redirectErrorStream(true)
             .start()
@@ -193,17 +207,18 @@ class DroidDeskService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // pm2 健康监控：定时检查 + 自动重启
+    // pm2 健康监控：定时检查 + 自动重启（仅当 supervisor 未启用时，supervisor 模式由 supervisor 自管 pm2）
     private val pm2WatchdogRunnable = object : Runnable {
         override fun run() {
             val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
-            // 仅在用户开启 pm2WithUbuntu 时才监控
-            if (sp.getBoolean("pm2WithUbuntu", false)) {
+            // 仅在用户开启 pm2WithUbuntu 且 supervisor 未开启时才监控（supervisor 模式下 pm2 由 supervisor 管）
+            if (sp.getBoolean("pm2WithUbuntu", false) &&
+                !sp.getBoolean("supervisorWithUbuntu", false)) {
                 try {
                     val runtime = LinuxRuntime.getInstance(applicationContext)
                     if (!runtime.isUbuntuPm2Running()) {
-                        Log.w(TAG, "pm2 watchdog: daemon dead, restarting...")
-                        runtime.startUbuntuPm2()
+                        Log.w(TAG, "pm2 watchdog: daemon dead, resurrecting in session...")
+                        runtime.resurrectPm2InSession()
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "pm2 watchdog failed: ${e.message}")
