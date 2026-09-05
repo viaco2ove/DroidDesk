@@ -91,49 +91,14 @@ class DroidDeskService : Service() {
                         Log.i(TAG, "Daemon active, restoring Ubuntu session...")
                         restoreUbuntuSession(runtime)
                     }
-                    // sshWithUbuntu=true 且 supervisor 未开启时，确保 sshd 也在跑
-                    // （supervisor 开启时由 supervisor 内部的 [program:sshd] 管理 sshd）
                     if (sp.getBoolean("sshWithUbuntu", false) &&
-                        !sp.getBoolean("supervisorWithUbuntu", false) &&
                         runtime.isUbuntuSshInstalled() &&
                         !runtime.isUbuntuSshdRunning()) {
                         Log.i(TAG, "Daemon active, starting sshd...")
                         runtime.startUbuntuSshd()
                     }
-                    // pm2WithUbuntu=true 时确保 pm2 守护进程在跑
-                    // supervisor 开启时由 supervisor 的 [program:pm2] 管理；否则由 service 通过 session 容器拉起
-                    if (sp.getBoolean("pm2WithUbuntu", false)) {
-                        if (sp.getBoolean("supervisorWithUbuntu", false)) {
-                            Log.i(TAG, "Daemon active, pm2 managed by supervisor")
-                        } else if (!runtime.isUbuntuPm2Running()) {
-                            Log.i(TAG, "Daemon active, resurrecting pm2 in session...")
-                            runtime.resurrectPm2InSession()
-                        } else {
-                            Log.i(TAG, "Daemon active, pm2 daemon already alive")
-                        }
-                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to restore Ubuntu session: ${e.message}")
-                }
-            }
-        }
-
-        // pm2 健康监控：每 60 秒检查 pm2 daemon，死了就重启
-        schedulePm2Watchdog(sp)
-        // supervisor 健康监控：每 60 秒检查 supervisord，死了就重启
-        scheduleSupervisorWatchdog(sp)
-
-        // supervisor 开启时优先启动（supervisor 内部管 sshd/nginx，所以传统 sshd 启动可以省略）
-        if (sp.getBoolean("supervisorWithUbuntu", false)) {
-            workerHandler?.post {
-                try {
-                    val runtime = LinuxRuntime.getInstance(this)
-                    if (!runtime.isUbuntuSupervisorRunning()) {
-                        Log.i(TAG, "Supervisor enabled, starting...")
-                        runtime.startUbuntuSupervisor()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start supervisor: ${e.message}")
                 }
             }
         }
@@ -149,17 +114,15 @@ class DroidDeskService : Service() {
         val prefixPath = runtime.prefixPath
 
         java.io.File(filesDir, "bin").mkdirs()
-        // pm2 daemon 必须和 SSH session 共用同一个 proot 容器（命名空间隔离导致独立容器无法互通）
-        // 在 session 容器启动时一次性 pm2 kill + pm2 resurrect，确保全局只有一个 daemon，
-        // .bashrc 里不再 resurrect（避免 SSH 进会话时再开一个 daemon）
+        // pm2 daemon 由 supervisor 主容器托管，session 容器只是客户端：
+        // 启动 shell 时绝不 pkill / pm2 kill 现存 daemon，仅当 daemon 缺失时才补拉一次
         val wantPm2 = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
             .getBoolean("pm2WithUbuntu", false)
-        // session 容器内部命令：先清掉所有老 daemon（pkill + pm2 kill），再 resurrect
-        // 用 nohup + setsid 让 daemon 与 session shell 进程解绑，session 死了 daemon 也活着
+        // session 容器内部命令：daemon 存活（supervisor 托管或已有）→ 不动；全缺失 → 补 resurrect
         val pm2Setup = if (wantPm2) {
-            "pkill -9 -f 'pm2 God' 2>/dev/null; pkill -9 -f 'PM2 v' 2>/dev/null; " +
-            "pm2 kill 2>/dev/null; sleep 1; " +
-            "nohup pm2 resurrect >/dev/null 2>&1 </dev/null & "
+            "PM2_PID_FILE=/root/.pm2/pm2.pid; " +
+            "if [ -f \"\$PM2_PID_FILE\" ] && kill -0 \$(cat \"\$PM2_PID_FILE\") 2>/dev/null; then :; " +
+            "else nohup pm2 resurrect >/dev/null 2>&1 </dev/null & fi; "
         } else ""
         val innerCmd = "${pm2Setup}exec /bin/bash -i -l"
         val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
@@ -207,68 +170,10 @@ class DroidDeskService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // pm2 健康监控：定时检查 + 自动重启（仅当 supervisor 未启用时，supervisor 模式由 supervisor 自管 pm2）
-    private val pm2WatchdogRunnable = object : Runnable {
-        override fun run() {
-            val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
-            // 仅在用户开启 pm2WithUbuntu 且 supervisor 未开启时才监控（supervisor 模式下 pm2 由 supervisor 管）
-            if (sp.getBoolean("pm2WithUbuntu", false) &&
-                !sp.getBoolean("supervisorWithUbuntu", false)) {
-                try {
-                    val runtime = LinuxRuntime.getInstance(applicationContext)
-                    if (!runtime.isUbuntuPm2Running()) {
-                        Log.w(TAG, "pm2 watchdog: daemon dead, resurrecting in session...")
-                        runtime.resurrectPm2InSession()
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "pm2 watchdog failed: ${e.message}")
-                }
-            }
-            // 60 秒后再调度
-            workerHandler?.postDelayed(this, 60_000)
-        }
-    }
-
-    private fun schedulePm2Watchdog(sp: android.content.SharedPreferences) {
-        if (sp.getBoolean("pm2WithUbuntu", false)) {
-            workerHandler?.removeCallbacks(pm2WatchdogRunnable)
-            workerHandler?.postDelayed(pm2WatchdogRunnable, 60_000)
-            Log.i(TAG, "pm2 watchdog scheduled")
-        }
-    }
-
-    // supervisor 健康监控
-    private val supervisorWatchdogRunnable = object : Runnable {
-        override fun run() {
-            val sp = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
-            if (sp.getBoolean("supervisorWithUbuntu", false)) {
-                try {
-                    val runtime = LinuxRuntime.getInstance(applicationContext)
-                    if (!runtime.isUbuntuSupervisorRunning()) {
-                        Log.w(TAG, "supervisor watchdog: daemon dead, restarting...")
-                        runtime.startUbuntuSupervisor()
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "supervisor watchdog failed: ${e.message}")
-                }
-            }
-            workerHandler?.postDelayed(this, 60_000)
-        }
-    }
-
-    private fun scheduleSupervisorWatchdog(sp: android.content.SharedPreferences) {
-        if (sp.getBoolean("supervisorWithUbuntu", false)) {
-            workerHandler?.removeCallbacks(supervisorWatchdogRunnable)
-            workerHandler?.postDelayed(supervisorWatchdogRunnable, 60_000)
-            Log.i(TAG, "supervisor watchdog scheduled")
-        }
-    }
-
+    // pm2 / supervisor 健康监控已迁移至 DroidDesk Tower（统一进程管理器）
     override fun onDestroy() {
         KeepAliveFloat.dismiss()
         releaseWakeLock()
-        workerHandler?.removeCallbacks(pm2WatchdogRunnable)
-        workerHandler?.removeCallbacks(supervisorWatchdogRunnable)
         workerThread?.quitSafely()
         workerThread = null
         workerHandler = null

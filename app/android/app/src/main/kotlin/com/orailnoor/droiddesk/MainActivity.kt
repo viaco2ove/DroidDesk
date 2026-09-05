@@ -744,6 +744,64 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                // ── DroidDesk Tower ──
+                "isTowerInstalled" -> {
+                    val installed = linuxRuntime.isTowerInstalled()
+                    result.success(installed)
+                }
+
+                "installTower" -> {
+                    Thread {
+                        val ok = linuxRuntime.installTower { progress, status ->
+                            runOnUiThread {
+                                flutterEngine.dartExecutor.binaryMessenger.let {
+                                    MethodChannel(it, CHANNEL).invokeMethod(
+                                        "onInstallProgress",
+                                        mapOf("progress" to progress, "status" to status)
+                                    )
+                                }
+                            }
+                        }
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "uninstallTower" -> {
+                    Thread {
+                        val ok = linuxRuntime.uninstallTower()
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "getTowerStatus" -> {
+                    val status = linuxRuntime.getTowerStatus()
+                    result.success(status)
+                }
+
+                "startTowerService" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    Thread {
+                        val ok = linuxRuntime.towerStartService(name)
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "stopTowerService" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    Thread {
+                        val ok = linuxRuntime.towerStopService(name)
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "restartTowerService" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    Thread {
+                        val ok = linuxRuntime.towerRestartService(name)
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
                 "setupBootstrap" -> {
                     if (chrootRuntime.hasRoot()) {
                         // Nothing to bootstrap for chroot; rootfs handles it

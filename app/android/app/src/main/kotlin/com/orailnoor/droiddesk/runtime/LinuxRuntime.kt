@@ -1685,19 +1685,17 @@ class LinuxRuntime(private val context: Context) {
 
     /**
      * 在已有 session 容器内注入 pm2 命令（短命令，不开新容器）。
-     * 通过文件锁 + pm2.pid 校验确保只拉起一个 daemon：
-     *  1. 先读 pm2.pid；如果指向真实存活进程 → 直接 ping，不做事
-     *  2. 否则：先 pm2 kill（优雅） + pkill -9（兜底），再 pm2 resurrect
-     * 不开新容器、不替换 shell，是"轻量级" RPC 调用。
+     * 无破坏语义：绝不 pkill / pm2 kill 现存 daemon（否则会杀掉 supervisor 托管的唯一 daemon）。
+     * 逻辑：daemon 存活 → 直接不动；daemon 缺失 → 清残留 socket 并 resurrect 拉起。
+     * 全局只允许存在一个 daemon（由 supervisor 主容器托管），其它入口仅作客户端。
      */
     fun resurrectPm2InSession(): Boolean {
         return try {
             val innerCmd = "PM2_PID_FILE=/root/.pm2/pm2.pid; " +
-                    // 清理：杀掉所有现存 daemon（多个实例会互抢 socket）
-                    "pkill -9 -f 'pm2 God' 2>/dev/null; pkill -9 -f 'PM2 v' 2>/dev/null; " +
-                    "pm2 kill 2>/dev/null; sleep 1; " +
-                    "rm -f /root/.pm2/pm2.pid; " +
-                    // resurrect：用 nohup 让 daemon 脱离当前 shell（proot 命令退出也不会死）
+                    // daemon 已存活：直接退出，不做任何事（不杀、不重建）
+                    "if [ -f \"\$PM2_PID_FILE\" ] && kill -0 \$(cat \"\$PM2_PID_FILE\") 2>/dev/null; then exit 0; fi; " +
+                    // daemon 缺失：清残留 socket/pid 文件后 resurrect（nohup 让 daemon 脱离当前 shell）
+                    "rm -f /root/.pm2/pm2.pid /root/.pm2/rpc.sock /root/.pm2/pub.sock 2>/dev/null; " +
                     "nohup pm2 resurrect >/dev/null 2>&1 </dev/null & " +
                     "disown; sleep 2; " +
                     "exit 0"
@@ -1748,6 +1746,54 @@ class LinuxRuntime(private val context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "isUbuntuPm2Running failed: ${e.message}")
             false
+        }
+    }
+
+    /**
+     * 检测容器内 PM2 God Daemon 实例数量。
+     * 如果 >1（多个 daemon 互抢 socket 导致 pm2 status 不稳定），调用方应触发清理。
+     */
+    fun countUbuntuPm2Daemons(): Int {
+        return try {
+            val fullCmd = buildProotLoginCmd("pgrep -fc 'PM2 v.*God Daemon'")
+            val p = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            val finished = p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) { p.destroyForcibly(); return 1 }
+            p.inputStream.bufferedReader().readText().trim().toIntOrNull() ?: 0
+        } catch (e: Exception) {
+            Log.w(TAG, "countUbuntuPm2Daemons failed: ${e.message}")
+            1
+        }
+    }
+
+    /**
+     * 兜底确保存在一个 pm2 daemon（无破坏语义）。
+     * 不再 pkill 任何 daemon：全系统唯一 daemon 由 supervisor 主容器托管，
+     * 此处仅当 daemon 缺失（pm2.pid 无存活进程）时补拉一次 resurrect。
+     */
+    fun killExtraPm2Daemons() {
+        try {
+            val fullCmd = buildProotLoginCmd(
+                "PM2_PID_FILE=/root/.pm2/pm2.pid; " +
+                // daemon 已存活：不动
+                "if [ -f \"\$PM2_PID_FILE\" ] && kill -0 \$(cat \"\$PM2_PID_FILE\") 2>/dev/null; then exit 0; fi; " +
+                // daemon 缺失：清残留后 resurrect（不循环、不赶时间，由 supervisor 接管后续）
+                "rm -f /root/.pm2/pm2.pid /root/.pm2/rpc.sock /root/.pm2/pub.sock 2>/dev/null; " +
+                "nohup pm2 resurrect >/dev/null 2>&1 </dev/null & " +
+                "disown; sleep 2; exit 0"
+            )
+            val p = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply { commonProotEnv() }
+                .start()
+            val finished = p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) p.destroyForcibly()
+            Log.i(TAG, "killExtraPm2Daemons done")
+        } catch (e: Exception) {
+            Log.w(TAG, "killExtraPm2Daemons failed: ${e.message}")
         }
     }
 
@@ -1893,14 +1939,14 @@ stderr_logfile_maxbytes=5MB
 stderr_logfile_backups=2
 
 [program:pm2]
-# 启动 pm2 daemon 并保持存活：
-# 先杀掉所有现存 daemon（防多实例），然后 pm2 resurrect 起 daemon，
-# 之后用 tail -f /dev/null 保持 supervisor 看到 wrapper 永远存活（daemon 漂在容器内）
-# service 的 watchdog 负责检测 daemon 状态并触发 resurrect（如果 daemon 死掉）
-command=/bin/bash -c 'pkill -9 -f "pm2 God" 2>/dev/null; pkill -9 -f "PM2 v" 2>/dev/null; sleep 1; pm2 resurrect >/dev/null 2>&1 || true; exec tail -f /dev/null'
+# 由 droiddesk-pm2.sh 启动器托管 pm2 daemon：先在容器内 pkill 所有残留 God Daemon（含孤儿），
+# 再启动唯一 daemon 并 resurrect dump.pm2 恢复应用，附带 60s watchdog。
+# 与 sshd/nginx 共享同一 supervisor 主容器与 ~/.pm2 socket，保证面板/ssh/App 三入口看到同一进程列表。
+environment=PM2_HOME="/root/.pm2"
+command=/usr/local/bin/droiddesk-pm2.sh
 autostart=true
 autorestart=true
-startsecs=10
+startsecs=8
 startretries=100
 stopsignal=TERM
 stopwaitsecs=10
@@ -1930,12 +1976,110 @@ stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=2
 """
             val conf = sshdSection + if (includeNginx) nginxSection else ""
+            // 同时写入启动脚本：写一个 bash 脚本到 /usr/local/bin/droiddesk-pm2.sh
+            // 脚本里做：清理多 daemon → 启动 Daemon.js → 加载 dump → 长 sleep
+            // 用 base64 编码避免 shell 转义问题
+            val pm2Script = """#!/bin/bash
+# droiddesk-pm2.sh — supervisor [program:pm2] 启动器（v2）
+# 修复点：
+#  1. node 冷启动慢（proot 内可达 60s+），等 sock 上限从 15s -> 120s，且要求 pid 存活 + sock 就绪双条件
+#     避免超时后 pm2 resurrect 由 CLI 自发 spawn 第二个竞争 daemon
+#  2. 首次启动前按 dump.pm2 清理孤儿业务进程，防止 resurrect 后端口/资源冲突
+#  3. watchdog 增强：daemon 缺失时完整重建（清场->起 daemon->等就绪->resurrect），不再躺平
+#  4. 关键节点写 /var/log/supervisor/pm2-boot.log 便于排障；成功后 pm2 save 固化 dump
+export PM2_HOME="/root/.pm2"
+LOG=/var/log/supervisor/pm2-boot.log
+DAEMON_BIN=/usr/local/bin/node
+DAEMON_JS=/usr/local/lib/node_modules/pm2/lib/Daemon.js
+echo "=== pm2 boot $(date '+%F %T') ===" >> "${'$'}LOG"
+
+daemon_ok() {
+  [ -f "${'$'}{PM2_HOME}/pm2.pid" ] && kill -0 "$(cat "${'$'}{PM2_HOME}/pm2.pid" 2>/dev/null)" 2>/dev/null && [ -S "${'$'}{PM2_HOME}/rpc.sock" ]
+}
+
+ensure_daemon() {
+  if daemon_ok; then return 0; fi
+  echo "[ensure] daemon missing, rebuilding" >> "${'$'}LOG"
+  pkill -9 -f "PM2 v.*God Daemon" 2>/dev/null || true
+  sleep 2
+  rm -f "${'$'}{PM2_HOME}/pm2.pid" "${'$'}{PM2_HOME}/rpc.sock" "${'$'}{PM2_HOME}/pub.sock" 2>/dev/null || true
+  setsid "${'$'}DAEMON_BIN" "${'$'}DAEMON_JS" >> "${'$'}LOG" 2>&1 &
+  for i in $(seq 1 120); do
+    if daemon_ok; then
+      echo "[ensure] daemon ready in ${'$'}{i}s pid=$(cat "${'$'}{PM2_HOME}/pm2.pid")" >> "${'$'}LOG"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[ensure] daemon NOT ready in 120s" >> "${'$'}LOG"
+  return 1
+}
+
+cleanup_orphans() {
+  local paths n=0
+  paths=$("${'$'}DAEMON_BIN" -e '
+    const fs=require("fs");
+    try {
+      const d=JSON.parse(fs.readFileSync(process.env.PM2_HOME+"/dump.pm2","utf8"));
+      const arr=Array.isArray(d)?d:(d.apps||d.list||[]);
+      const s=new Set(); (arr||[]).forEach(x=>{if(x&&x.pm_exec_path)s.add(x.pm_exec_path)});
+      process.stdout.write([...s].join("\n"));
+    } catch(e){}' 2>/dev/null)
+  for p in ${'$'}paths; do
+    [ -n "${'$'}p" ] || continue
+    if pkill -9 -f "${'$'}p" 2>/dev/null; then n=$((n+1)); fi
+  done
+  [ "${'$'}n" -gt 0 ] && echo "[cleanup] killed ${'$'}n orphan procs" >> "${'$'}LOG"
+}
+
+ensure_apps() {
+  local before after
+  before=$(pm2 jlist 2>/dev/null | grep -c '{' || true)
+  pm2 resurrect >> "${'$'}LOG" 2>&1 || echo "[apps] resurrect rc=$?" >> "${'$'}LOG"
+  sleep 3
+  after=$(pm2 jlist 2>/dev/null | grep -c '{' || true)
+  echo "[apps] resurrect before=${'$'}before after=${'$'}after" >> "${'$'}LOG"
+  pm2 save >> "${'$'}LOG" 2>&1 || true
+  [ "${'$'}after" -gt 0 ] && echo "[apps] recovered ${'$'}after entries" >> "${'$'}LOG"
+}
+
+# 首次启动：清孤儿 -> 确保 daemon -> 恢复应用
+cleanup_orphans
+if ensure_daemon; then ensure_apps; else echo "[boot] daemon fail, apps not restored" >> "${'$'}LOG"; fi
+
+# 守护循环：每 30s 查 daemon；daemon 缺失 -> 重建；列表空 -> resurrect
+(
+  while true; do
+    sleep 30
+    if ! daemon_ok; then
+      echo "[watchdog] daemon down at $(date '+%T')" >> "${'$'}LOG"
+      pkill -9 -f "PM2 v.*God Daemon" 2>/dev/null || true
+      sleep 1
+      cleanup_orphans
+      ensure_daemon && ensure_apps
+      continue
+    fi
+    n=$(pm2 jlist 2>/dev/null | grep -c '{' || true)
+    if [ "${'$'}n" -eq 0 ]; then
+      echo "[watchdog] empty list, resurrect" >> "${'$'}LOG"
+      pm2 resurrect >> "${'$'}LOG" 2>&1 || true
+    fi
+  done
+) >/dev/null 2>&1 &
+disown
+exec tail -f /dev/null
+"""
+            val scriptBytes = pm2Script.toByteArray(Charsets.UTF_8)
+            val scriptB64 = java.util.Base64.getEncoder().encodeToString(scriptBytes)
+            val scriptChunked = scriptB64.chunked(76).joinToString("\n")
             // 先写本地文件，再用 base64 编码后通过 cat 写入容器内（避免 shell 转义问题）
             val confBytes = conf.toByteArray(Charsets.UTF_8)
             val b64 = java.util.Base64.getEncoder().encodeToString(confBytes)
             // 分块写入（base64 字符串可能很长），分块大小 76 字符/行（标准 base64 行宽）
             val chunked = b64.chunked(76).joinToString("\n")
-            val cmd = "proot-distro $baseArgs sh -c \"mkdir -p /etc/supervisor/conf.d /var/log/supervisor && echo '$chunked' | base64 -d > /etc/supervisor/conf.d/droiddesk.conf && chmod 644 /etc/supervisor/conf.d/droiddesk.conf\""
+            val cmd = "proot-distro $baseArgs sh -c \"mkdir -p /etc/supervisor/conf.d /var/log/supervisor /usr/local/bin && " +
+                    "echo '$scriptChunked' | base64 -d > /usr/local/bin/droiddesk-pm2.sh && chmod 755 /usr/local/bin/droiddesk-pm2.sh && " +
+                    "echo '$chunked' | base64 -d > /etc/supervisor/conf.d/droiddesk.conf && chmod 644 /etc/supervisor/conf.d/droiddesk.conf\""
             val p = ProcessBuilder("sh", "-c", cmd)
                 .redirectErrorStream(true)
                 .apply { commonProotEnv() }
@@ -1978,14 +2122,41 @@ stderr_logfile_backups=2
     }
 
     /**
+     * 清理 OS 上残留的孤儿 supervisord（force-stop 后旧 supervisor 容器可能还活着）。
+     * 只按 supervisord 进程匹配，绝不 pkill 其它 proot 容器（sshd/终端 shell 等仍是客户端），
+     * 也不会杀 pm2 daemon（全系统只有 supervisor 托管的唯一 daemon，杀了会破坏进程管理）。
+     */
+    private fun killStaleSupervisors() {
+        try {
+            // 只杀 supervisord 进程；不碰 proot loader，避免误杀正在使用的 sshd/shell 容器
+            val cmd = "for pid in $(pgrep -f supervisord); do " +
+                    "echo killing supervisord \$pid; " +
+                    "kill -9 \$pid 2>/dev/null; done"
+            val p = ProcessBuilder("sh", "-c", cmd)
+                .redirectErrorStream(true)
+                .start()
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            val out = p.inputStream.bufferedReader().readText().trim()
+            if (out.isNotEmpty()) Log.w(TAG, "killed stale: $out")
+            Thread.sleep(1500) // 给 OS 时间回收 socket/pid 文件
+        } catch (e: Exception) {
+            Log.w(TAG, "killStaleSupervisors: ${e.message}")
+        }
+    }
+
+    /**
      * 启动 supervisor：单独开一个 proot 容器跑 supervisord，
      * 容器保持运行直到显式 stop。幂等。
+     * 启动前先检查 OS 上是否已有别的 droiddesk supervisor 容器在跑（避免重启 app 后多容器冲突）
      */
     fun startUbuntuSupervisor(): Boolean {
         if (supervisorProcess?.isAlive == true) {
-            Log.i(TAG, "startUbuntuSupervisor: already running")
+            Log.i(TAG, "startUbuntuSupervisor: already running (in-process)")
             return true
         }
+        // 启动前只清理 OS 上残留的孤儿 supervisord（force-stop 后旧 supervisor 容器可能还活着）；
+        // 绝不杀其它 proot 容器或 pm2 daemon，sshd/终端 shell 只是客户端
+        killStaleSupervisors()
         stopUbuntuSupervisor()
         val sp = context.getSharedPreferences("ubuntu_console", android.content.Context.MODE_PRIVATE)
         return try {
@@ -2393,5 +2564,228 @@ stderr_logfile_backups=2
             it.destroy()
         }
         activeCommandProcess = null
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DroidDesk Tower
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Check if Tower is installed in proot Ubuntu.
+     * Tower lives at /opt/droiddesk/tower/ inside the ubuntu container.
+     */
+    fun isTowerInstalled(): Boolean {
+        val result = executeCommand(
+            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+            "\"test -f /opt/droiddesk/tower/tower-pm2.py\""
+        )
+        return result.trim() == ""  // empty = command succeeded = file exists
+    }
+
+    /**
+     * Install Tower into proot Ubuntu.
+     * Writes tower-pm2.py, services.json, tower-start, tower-stop, tower-list, install.sh, uninstall.sh
+     * from Flutter assets into /opt/droiddesk/tower/ inside the ubuntu container.
+     * Then creates /etc/tower/ directory and sets up log directories.
+     *
+     * Returns true on success.
+     */
+    fun installTower(onProgress: ((Double, String) -> Unit)? = null): Boolean {
+        val towerDir = "/opt/droiddesk/tower"
+        val etcTowerDir = "/etc/tower"
+        val runTowerDir = "/run/tower"
+        val logTowerDir = "/var/log/tower"
+
+        onProgress?.invoke(0.0, "Preparing...")
+
+        try {
+            // 1. Create directories inside proot Ubuntu
+            val dirsCmd = listOf(
+                towerDir,
+                etcTowerDir,
+                runTowerDir,
+                logTowerDir,
+            ).joinToString(" && ") { "mkdir -p $it" }
+
+            var out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$dirsCmd'"
+            )
+            if (out.contains("Error", ignoreCase = true)) {
+                Log.e(TAG, "installTower: failed to create directories: $out")
+                return false
+            }
+            onProgress?.invoke(0.1, "Directories created")
+
+            // 2. Write each asset file via proot-distro
+            // We use a simple approach: write the asset content as a shell heredoc via stdin
+            val assetFiles = listOf(
+                "tower-pm2.py",
+                "services.json",
+                "tower-start",
+                "tower-stop",
+                "tower-list",
+                "install.sh",
+                "uninstall.sh",
+            )
+            val assetNames = listOf(
+                "assets/tower/tower-pm2.py",
+                "assets/tower/services.json",
+                "assets/tower/tower-start",
+                "assets/tower/tower-stop",
+                "assets/tower/tower-list",
+                "assets/tower/install.sh",
+                "assets/tower/uninstall.sh",
+            )
+
+            assetNames.forEachIndexed { idx, assetPath ->
+                val progress = 0.1 + (idx.toDouble() / assetNames.size) * 0.7
+                onProgress?.invoke(progress, "Copying ${assetFiles[idx]}...")
+                try {
+                    val content = context.assets.open(assetPath).bufferedReader().use { it.readText() }
+                    // Escape single quotes for shell embedding
+                    val escaped = content.replace("'", "'\\''")
+                    // Write via proot with a shell heredoc
+                    val destPath = "$towerDir/${assetFiles[idx]}"
+                    // Make the shell script executable
+                    val chmodCmd = "chmod +x $destPath"
+                    // Use printf to safely write content (no special char issues)
+                    val escapedBase64 = android.util.Base64.encodeToString(
+                        content.toByteArray(charset("UTF-8")),
+                        android.util.Base64.NO_WRAP
+                    )
+                    val writeCmd = "printf '%s' '$escapedBase64' | base64 -d > $destPath"
+                    val fullCmd = "cd $towerDir && $writeCmd && $chmodCmd"
+                    out = executeCommand(
+                        "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$fullCmd'"
+                    )
+                    // Check for error indicators
+                    if (out.contains("Error", ignoreCase = true) ||
+                        out.contains("Permission denied", ignoreCase = true)) {
+                        Log.w(TAG, "installTower: warning writing $destPath: $out")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "installTower: failed to read asset $assetPath: ${e.message}")
+                    // Continue with other files
+                }
+            }
+            onProgress?.invoke(0.85, "Setting permissions...")
+
+            // 3. Ensure run/tower and log/tower dirs exist (already done above, but idempotent)
+            executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'mkdir -p $runTowerDir $logTowerDir && chmod 755 $runTowerDir $logTowerDir'"
+            )
+
+            onProgress?.invoke(1.0, "Tower installed successfully")
+            Log.i(TAG, "installTower: done")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "installTower: failed", e)
+            onProgress?.invoke(-1.0, "Installation failed: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Uninstall Tower from proot Ubuntu.
+     * Removes /opt/droiddesk/tower/ and /etc/tower/ but does NOT touch
+     * the user's business processes (toonflow-game, etc.).
+     */
+    fun uninstallTower(): Boolean {
+        try {
+            val cmd = "rm -rf /opt/droiddesk /etc/tower"
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$cmd'"
+            )
+            Log.i(TAG, "uninstallTower: $out")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "uninstallTower: failed", e)
+            return false
+        }
+    }
+
+    /**
+     * Get Tower agent health by checking its TCP port.
+     * Returns: {installed, running, port, pid}
+     */
+    fun getTowerStatus(): Map<String, Any> {
+        val installed = isTowerInstalled()
+        if (!installed) {
+            return mapOf("installed" to false, "running" to false, "port" to 7088)
+        }
+        try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'cat /run/tower/tower-pm2.pid 2>/dev/null || echo \"\"'"
+            )
+            val pid = out.trim().toIntOrNull()
+            val running = pid != null && executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'test -d /proc/$pid'"
+            ).trim().isEmpty()
+            return mapOf(
+                "installed" to true,
+                "running" to (running && pid != null),
+                "pid" to (pid ?: 0),
+                "port" to 7088,
+            )
+        } catch (e: Exception) {
+            return mapOf("installed" to installed, "running" to false, "port" to 7088)
+        }
+    }
+
+    /**
+     * Start a service via Tower HTTP API.
+     * Calls POST /api/services/{name}/start
+     */
+    fun towerStartService(name: String): Boolean {
+        if (!isTowerInstalled()) return false
+        try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/start'"
+            val out = executeCommand(cmd)
+            Log.i(TAG, "towerStartService($name): $out")
+            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+        } catch (e: Exception) {
+            Log.e(TAG, "towerStartService($name) failed: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Stop a service via Tower HTTP API.
+     * Calls POST /api/services/{name}/stop
+     */
+    fun towerStopService(name: String): Boolean {
+        if (!isTowerInstalled()) return false
+        try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/stop'"
+            val out = executeCommand(cmd)
+            Log.i(TAG, "towerStopService($name): $out")
+            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+        } catch (e: Exception) {
+            Log.e(TAG, "towerStopService($name) failed: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Restart a service via Tower HTTP API.
+     * Calls POST /api/services/{name}/restart
+     */
+    fun towerRestartService(name: String): Boolean {
+        if (!isTowerInstalled()) return false
+        try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/restart'"
+            val out = executeCommand(cmd)
+            Log.i(TAG, "towerRestartService($name): $out")
+            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+        } catch (e: Exception) {
+            Log.e(TAG, "towerRestartService($name) failed: ${e.message}")
+            return false
+        }
     }
 }

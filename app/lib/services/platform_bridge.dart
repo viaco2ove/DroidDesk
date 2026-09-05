@@ -275,4 +275,57 @@ class DroidDeskPlatform {
     final result = await _channel.invokeMethod('isBatteryOptimized');
     return result as bool? ?? true;
   }
+
+  // ── DroidDesk Tower ──────────────────────────────────────────────────────────
+
+  /// Returns true if Tower is installed in proot Ubuntu.
+  static Future<bool> isTowerInstalled() async {
+    final r = await _channel.invokeMethod<bool>('isTowerInstalled');
+    return r ?? false;
+  }
+
+  /// Install Tower into proot Ubuntu. Returns true on success.
+  static Future<bool> installTower({void Function(double progress, String status)? onProgress}) async {
+    // Set up the progress callback
+    onDownloadProgress = onProgress;
+    final r = await _channel.invokeMethod<bool>('installTower');
+    onDownloadProgress = null;
+    return r ?? false;
+  }
+
+  /// Uninstall Tower. Returns true on success.
+  static Future<bool> uninstallTower() async {
+    final r = await _channel.invokeMethod<bool>('uninstallTower');
+    return r ?? false;
+  }
+
+  /// Tower agent status: {installed: bool, running: bool, port: int, pid: int?}
+  static Future<Map<String, dynamic>> getTowerStatus() async {
+    final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('getTowerStatus');
+    final m = raw ?? const {};
+    return {
+      'installed': m['installed'] == true,
+      'running': m['running'] == true,
+      'port': (m['port'] is num) ? (m['port'] as num).toInt() : 7088,
+      'pid': m['pid'] is int ? m['pid'] as int : null,
+    };
+  }
+
+  /// Start a specific service via Tower API.
+  static Future<bool> startTowerService(String name) async {
+    final r = await _channel.invokeMethod<bool>('startTowerService', {'name': name});
+    return r ?? false;
+  }
+
+  /// Stop a specific service via Tower API.
+  static Future<bool> stopTowerService(String name) async {
+    final r = await _channel.invokeMethod<bool>('stopTowerService', {'name': name});
+    return r ?? false;
+  }
+
+  /// Restart a specific service via Tower API.
+  static Future<bool> restartTowerService(String name) async {
+    final r = await _channel.invokeMethod<bool>('restartTowerService', {'name': name});
+    return r ?? false;
+  }
 }

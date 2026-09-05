@@ -18,9 +18,6 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   bool _sshWithUbuntu = false;
   bool _sshInstalled = false;
   bool _keepAliveFloat = true;
-  bool _pm2WithUbuntu = false;
-  bool _supervisorWithUbuntu = false;
-  bool _supervisorNginxWithUbuntu = false;
   bool _supervisorInstalled = false;
   bool _installingSupervisor = false;
   bool _canDrawOverlays = false;
@@ -43,43 +40,6 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     WidgetsBinding.instance.addObserver(this);
     _load();
     _statusTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshStatus());
-    _checkSupervisorInstall();
-    DroidDeskPlatform.onSupervisorInstallProgress = _onSupervisorProgress;
-  }
-
-  void _onSupervisorProgress(double progress, String status) {
-    // 安装进度通过 SnackBar 显示
-    if (!mounted) return;
-    setState(() {
-      // progress 是 0..1
-    });
-  }
-
-  Future<void> _checkSupervisorInstall() async {
-    final installed = await DroidDeskPlatform.isSupervisorInstalled();
-    if (!mounted) return;
-    setState(() => _supervisorInstalled = installed);
-  }
-
-  Future<void> _installSupervisor() async {
-    if (_installingSupervisor) return;
-    setState(() => _installingSupervisor = true);
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.showSnackBar(
-      const SnackBar(
-        content: Text('正在安装 supervisor（apt-get install，需 1-3 分钟）'),
-        duration: Duration(seconds: 5),
-      ),
-    );
-    final ok = await DroidDeskPlatform.installSupervisor();
-    if (!mounted) return;
-    setState(() {
-      _installingSupervisor = false;
-      _supervisorInstalled = ok;
-    });
-    messenger.showSnackBar(
-      SnackBar(content: Text(ok ? 'supervisor 安装成功' : 'supervisor 安装失败')),
-    );
   }
 
   @override
@@ -161,9 +121,6 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
         _sshWithUbuntu = settings['sshWithUbuntu'] ?? false;
         _sshInstalled = ssh;
         _keepAliveFloat = settings['keepAliveFloat'] ?? true;
-        _pm2WithUbuntu = settings['pm2WithUbuntu'] ?? false;
-        _supervisorWithUbuntu = settings['supervisorWithUbuntu'] ?? false;
-        _supervisorNginxWithUbuntu = settings['supervisorNginxWithUbuntu'] ?? false;
         _canDrawOverlays = canFloat;
         _userCtrl.text = creds['user'] ?? '';
         _passCtrl.text = creds['password'] ?? '';
@@ -367,83 +324,7 @@ const SizedBox(height: 16),
                             : '需要「显示悬浮窗」权限'),
                         activeColor: const Color(0xFFE95420),
                       ),
-                      const Divider(height: 1, color: DroidTheme.surfaceBorder),
-                      SwitchListTile(
-                        value: _pm2WithUbuntu,
-                        onChanged: (v) async {
-                          if (mounted) setState(() => _pm2WithUbuntu = v);
-                          await _toggle('pm2WithUbuntu', v);
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(v
-                                    ? 'pm2 自动保活已开启（service 会负责 resurrect）'
-                                    : 'pm2 自动保活已关闭'),
-                              ),
-                            );
-                          }
-                        },
-                        title: const Text('Auto-resurrect pm2'),
-                        subtitle: const Text(
-                            'Service 会在 pm2 守护进程挂掉时自动重启'),
-                        activeColor: const Color(0xFFE95420),
-                      ),
-                      const Divider(height: 1, color: DroidTheme.surfaceBorder),
-                      SwitchListTile(
-                        value: _supervisorWithUbuntu,
-                        onChanged: _supervisorInstalled
-                            ? (v) async {
-                                if (mounted) setState(() => _supervisorWithUbuntu = v);
-                                await _toggle('supervisorWithUbuntu', v);
-                                if (mounted) {
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    SnackBar(
-                                      content: Text(v
-                                          ? 'supervisor 已开启（管理 sshd/nginx，自动保活）'
-                                          : 'supervisor 已关闭'),
-                                    ),
-                                  );
-                                }
-                              }
-                            : (_installingSupervisor
-                                ? null
-                                : (_) => _installSupervisor()),
-                        title: const Text('Run as Supervisor'),
-                        subtitle: Text(_installingSupervisor
-                            ? '正在安装 supervisor...'
-                            : (_supervisorInstalled
-                                ? 'Supervisord 守护进程 + 自动保活 sshd/nginx'
-                                : '点击安装 supervisor（apt-get install -y supervisor）')),
-                        activeColor: const Color(0xFFE95420),
-                      ),
-                      // Nginx keep-alive 子开关（仅在 supervisor 已安装时显示）
-                      if (_supervisorInstalled) ...[
-                        Padding(
-                          padding: const EdgeInsets.only(left: 16),
-                          child: SwitchListTile(
-                            value: _supervisorNginxWithUbuntu,
-                            onChanged: (v) async {
-                              if (mounted) setState(() => _supervisorNginxWithUbuntu = v);
-                              await _toggle('supervisorNginxWithUbuntu', v);
-                              if (mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text(v
-                                        ? 'Nginx 已加入 supervisor 自动保活'
-                                        : 'Nginx 已从 supervisor 移除'),
-                                  ),
-                                );
-                              }
-                            },
-                            title: const Text('Keep-alive Nginx'),
-                            subtitle: const Text(
-                                'Nginx 由 supervisor 管理崩溃自动重启（proot 环境可能无法绑定端口）'),
-                            dense: true,
-                            activeColor: const Color(0xFFE95420),
-                          ),
-                        ),
                       ],
-                    ],
                   ),
 
                   const SizedBox(height: 20),
