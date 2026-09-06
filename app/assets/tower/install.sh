@@ -68,10 +68,21 @@ fi
 
 # ── 4. 写入 shell 脚本 ─────────────────────────────────────
 echo "[4/5] 写入管理脚本 ..."
-for script in tower-start tower-stop tower-list; do
+for script in tower-start tower-stop tower-list tower-pm2 droiddesk-tower; do
     if [ -f "$(dirname "$0")/$script" ]; then
         cp "$(dirname "$0")/$script" "$PDIR/$script"
         chmod +x "$PDIR/$script"
+    fi
+done
+
+# ── 4.5 安装全局 CLI 命令 ───────────────────────────────────
+# droiddesk-tower / tower-pm2 放到 /usr/local/bin，任何 proot 实例内都可直接调用
+echo "[4.5/5] 安装全局 CLI (droiddesk-tower, tower-pm2)..."
+mkdir -p /usr/local/bin
+for cli in droiddesk-tower tower-pm2; do
+    if [ -f "$PDIR/$cli" ]; then
+        ln -sf "$PDIR/$cli" "/usr/local/bin/$cli"
+        chmod +x "/usr/local/bin/$cli"
     fi
 done
 
@@ -87,7 +98,10 @@ echo "PID 文件: $RUNDIR/tower-pm2.pid"
 echo "服务配置: $CONF/services.json"
 echo ""
 echo "常用命令:"
-echo "  bash $PDIR/tower-start          # 启动"
-echo "  bash $PDIR/tower-stop           # 停止"
-echo "  bash $PDIR/tower-list           # 查看状态"
-echo "  python3 $PDIR/tower-pm2.py      # 前台运行（调试）"
+echo "  droiddesk-tower panel status            # 面板状态"
+echo "  droiddesk-tower service list            # 服务列表"
+echo "  droiddesk-tower service start <name>    # 启动服务"
+echo "  tower-pm2 list                          # pm2 风格列表"
+echo "  tower-pm2 monit                         # 实时监控"
+echo "  bash $PDIR/tower-start                  # 启动面板（低层）"
+echo "  bash $PDIR/tower-stop                   # 停止面板（低层）"

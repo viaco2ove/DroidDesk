@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+droiddesk-tower — DroidDesk Tower 统一 CLI
+────────────────────────────────────────────
+模块: panel | ssh | nginx | service | pm2
+所有模块状态通过 HTTP API (127.0.0.1:7088) 读取 —— pid 一致性保证：
+无论从哪个 proot 实例执行（ubuntu shell / SSH / 脚本），结果一致。
+
+用法:
+  droiddesk-tower <module> <subcommand> [args] [--json]
+  droiddesk-tower --help | --version
+"""
+
+import sys
+import os
+import json
+import subprocess
+import urllib.request
+from pathlib import Path
+
+API = "http://127.0.0.1:7088"
+VERSION = "1.0.0"
+TOWER_DIR = "/opt/droiddesk/tower"
+CONF_DIR = "/etc/tower"
+LOG_DIR = "/var/log/tower"
+RUN_DIR = "/run/tower"
+
+
+# ── HTTP API 客户端 ──────────────────────────────────────────
+def api_get(path: str, timeout: int = 5) -> dict:
+    try:
+        with urllib.request.urlopen(API + path, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def api_post(path: str, data: dict = None, timeout: int = 20) -> dict:
+    try:
+        req = urllib.request.Request(
+            API + path, method="POST",
+            data=json.dumps(data or {}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def api_ok(path: str, data: dict = None) -> int:
+    r = api_post(path, data)
+    if r.get("ok"):
+        print(r.get("message") or "ok")
+        return 0
+    print(f"error: {r.get('error')}", file=sys.stderr)
+    return 1
+
+
+# ── 工具 ─────────────────────────────────────────────────────
+def sh(cmd: str, timeout: int = 10) -> str:
+    """本地 shell 执行（容器内）"""
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return f"error: {e}"
+
+
+def disp_width(s: str) -> int:
+    return sum(2 if ord(c) > 0x2E7F else 1 for c in s)
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - disp_width(s))
+
+
+def port_alive(port: int, timeout: float = 2.0) -> bool:
+    """TCP 端口探活"""
+    import socket
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def is_json_mode(args: list) -> tuple:
+    if "--json" in args:
+        args.remove("--json")
+        return args, True
+    return args, False
+
+
+# ══ panel 模块 ═══════════════════════════════════════════════
+def cmd_panel(args: list) -> int:
+    args, json_mode = is_json_mode(args)
+    sub = args[0] if args else "status"
+
+    if sub == "status":
+        sysinfo = api_get("/api/system")
+        installed = Path(TOWER_DIR, "tower-pm2.py").exists()
+        running = port_alive(7088)
+        if json_mode:
+            print(json.dumps({
+                "installed": installed, "running": running, "port": 7088,
+                **({"system": sysinfo} if sysinfo.get("ok") else {}),
+            }, ensure_ascii=False, indent=2))
+            return 0
+        st = "● running" if running else "○ stopped"
+        print(f"DroidDesk Tower panel: {st}")
+        print(f"  port : {7088}")
+        print(f"  web  : http://<device-ip>:7088")
+        if sysinfo.get("ok"):
+            print(f"  load : {sysinfo.get('loadavg', ['-'])[0]}")
+            print(f"  mem  : {sysinfo.get('mem_used_gb', 0)}GB / {sysinfo.get('mem_total_gb', 0)}GB ({sysinfo.get('mem_pct', 0)}%)")
+            print(f"  disk : {sysinfo.get('disk_used_gb', 0)}GB / {sysinfo.get('disk_total_gb', 0)}GB")
+        return 0
+
+    if sub == "start":
+        return sh_ret(f"bash {TOWER_DIR}/tower-start 7088")
+    if sub == "stop":
+        return sh_ret(f"bash {TOWER_DIR}/tower-stop")
+    if sub == "restart":
+        sh_ret(f"bash {TOWER_DIR}/tower-stop")
+        return sh_ret(f"bash {TOWER_DIR}/tower-start 7088")
+    if sub == "port":
+        if len(args) > 1:
+            return 1  # 端口修改需重启面板，暂不支持热改
+        print(f"panel port: 7088")
+        return 0
+    if sub == "logs":
+        lines = args[1] if len(args) > 1 else "50"
+        out = sh(f"tail -n {lines} {LOG_DIR}/tower-pm2.log")
+        print(out)
+        return 0
+
+    print(f"unknown: panel {sub} (status|start|stop|restart|port|logs)", file=sys.stderr)
+    return 2
+
+
+def sh_ret(cmd: str) -> int:
+    out = sh(cmd, timeout=20)
+    print(out)
+    return 0 if "ERROR" not in out and "error" not in out else 1
+
+
+# ══ ssh 模块 ═════════════════════════════════════════════════
+def cmd_ssh(args: list) -> int:
+    args, json_mode = is_json_mode(args)
+    sub = args[0] if args else "status"
+
+    if sub == "status":
+        alive = port_alive(8122)
+        port_out = sh("grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}'")
+        port = port_out.strip() or "8122"
+        if json_mode:
+            print(json.dumps({"running": alive, "port": int(port) if port.isdigit() else 8122}))
+            return 0
+        st = "● running" if alive else "○ stopped"
+        print(f"OpenSSH: {st}")
+        print(f"  port: {port}")
+        return 0
+
+    if sub == "start":
+        out = sh("mkdir -p /run/sshd && nohup setsid /usr/sbin/sshd >/dev/null 2>&1 & sleep 1", timeout=10)
+        alive = port_alive(8122)
+        print("OpenSSH started" if alive else "OpenSSH start failed")
+        return 0 if alive else 1
+    if sub == "stop":
+        sh("pkill -f '/usr/sbin/sshd' 2>/dev/null; sleep 1")
+        print("OpenSSH stopped")
+        return 0
+    if sub == "restart":
+        cmd_ssh(["stop"])
+        return cmd_ssh(["start"])
+    if sub == "set-password":
+        if len(args) < 2:
+            user = "root"
+            pwd = args[0] if args else None
+        else:
+            user, pwd = args[0], args[1]
+        if not pwd:
+            print("usage: droiddesk-tower ssh set-password <password> [user]", file=sys.stderr)
+            return 2
+        out = sh(f"echo '{user}:{pwd}' | chpasswd 2>&1")
+        if "error" in out.lower():
+            print(out)
+            return 1
+        print(f"password updated for {user}")
+        return 0
+    if sub == "set-port":
+        if len(args) < 1 or not args[0].isdigit():
+            print("usage: droiddesk-tower ssh set-port <port>", file=sys.stderr)
+            return 2
+        port = args[0]
+        out = sh(f"sed -i 's/^Port .*/Port {port}/' /etc/ssh/sshd_config; grep -E '^Port ' /etc/ssh/sshd_config")
+        print(f"ssh port set to: {port} (restart to apply)")
+        return 0
+    if sub == "info":
+        port_out = sh("grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}'")
+        user = sh("whoami").strip()
+        if json_mode:
+            print(json.dumps({"user": user, "port": port_out or "8122", "running": port_alive(8122)}))
+            return 0
+        print(f"user: {user}")
+        print(f"port: {port_out or '8122'}")
+        print(f"running: {port_alive(8122)}")
+        return 0
+
+    print(f"unknown: ssh {sub}", file=sys.stderr)
+    return 2
+
+
+# ══ nginx 模块 ═══════════════════════════════════════════════
+def cmd_nginx(args: list) -> int:
+    args, json_mode = is_json_mode(args)
+    sub = args[0] if args else "status"
+
+    def nginx_running():
+        return port_alive(8088) or bool(sh("pgrep -x nginx || true").strip())
+
+    if sub == "status":
+        alive = nginx_running()
+        if json_mode:
+            print(json.dumps({"running": alive}))
+            return 0
+        st = "● running" if alive else "○ stopped"
+        print(f"Nginx: {st}")
+        return 0
+
+    if sub == "start":
+        out = sh("nohup setsid nginx >/dev/null 2>&1 & sleep 1")
+        if nginx_running():
+            print("Nginx started")
+            return 0
+        print(f"Nginx start failed: {out}")
+        return 1
+    if sub == "stop":
+        sh("nginx -s stop 2>/dev/null || pkill -x nginx; sleep 1")
+        print("Nginx stopped")
+        return 0
+    if sub == "restart":
+        sh("nginx -s stop 2>/dev/null || pkill -x nginx; sleep 1")
+        sh("nohup setsid nginx >/dev/null 2>&1 & sleep 1")
+        if nginx_running():
+            print("Nginx restarted")
+            return 0
+        print("Nginx restart failed")
+        return 1
+    if sub == "reload":
+        out = sh("nginx -s reload 2>&1")
+        if "error" not in out.lower():
+            print("Nginx reloaded")
+            return 0
+        print(out)
+        return 1
+    if sub == "config-test":
+        out = sh("nginx -t 2>&1")
+        print(out)
+        return 0 if "successful" in out else 1
+    if sub == "logs":
+        lines = args[1] if len(args) > 1 else "50"
+        print(sh(f"tail -n {lines} /var/log/nginx/error.log 2>/dev/null"))
+        return 0
+    if sub == "conf":
+        print(sh("nginx -t 2>&1 | grep -oP '(?<=file )[^;]+' || echo /etc/nginx/nginx.conf"))
+        return 0
+
+    print(f"unknown: nginx {sub}", file=sys.stderr)
+    return 2
+
+
+# ══ service 模块（高层封装）══════════════════════════════════
+def cmd_service(args: list) -> int:
+    args, json_mode = is_json_mode(args)
+    sub = args[0] if args else "list"
+
+    # service 命令自动确保 tower-pm2 在跑
+    if not port_alive(7088, timeout=1.5):
+        print("tower-pm2 daemon not running, starting...", file=sys.stderr)
+        sh_ret(f"bash {TOWER_DIR}/tower-start 7088")
+
+    if sub == "list":
+        return _service_list(json_mode)
+    if sub in ("add", "register"):
+        return _service_add(args[1:], json_mode)
+    if sub in ("delete", "remove", "rm"):
+        if len(args) < 2:
+            print("usage: droiddesk-tower service delete <name>", file=sys.stderr)
+            return 2
+        return api_ok(f"/api/delete/{args[1]}")
+    if sub == "config":
+        return _service_config(args[1:], json_mode)
+    if sub in ("start", "stop", "restart"):
+        if len(args) < 2:
+            print(f"usage: droiddesk-tower service {sub} <name>", file=sys.stderr)
+            return 2
+        return api_ok(f"/api/{sub}/{args[1]}")
+    if sub == "status":
+        if len(args) < 2:
+            return _service_list(json_mode)
+        r = api_get(f"/api/status/{args[1]}")
+        print(json.dumps(r, ensure_ascii=False, indent=2) if json_mode else str(r))
+        return 0 if r.get("ok") else 3
+    if sub == "logs":
+        if len(args) < 2:
+            print("usage: droiddesk-tower service logs <name> [lines]", file=sys.stderr)
+            return 2
+        name = args[1]
+        lines = args[2] if len(args) > 2 and args[2].isdigit() else "50"
+        for suffix in (".out.log", ".err.log"):
+            p = Path(LOG_DIR) / f"{name}{suffix}"
+            if p.exists():
+                print(f"──── {p} ────")
+                print(sh(f"tail -n {lines} {p}"))
+        return 0
+
+    print(f"unknown: service {sub}", file=sys.stderr)
+    return 2
+
+
+def _service_list(json_mode: bool) -> int:
+    r = api_get("/api/list")
+    if not r.get("ok"):
+        print(f"error: {r.get('error')}", file=sys.stderr)
+        return 5
+    svc = r.get("services", {})
+    if json_mode:
+        out = [{"id": i, "name": n, **st} for i, (n, st) in enumerate(sorted(svc.items()))]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    rows = []
+    for idx, (name, st) in enumerate(sorted(svc.items())):
+        status = st.get("status", "stopped")
+        icon = "●" if status == "online" else ("◐" if status == "degraded" else "○")
+        rows.append({
+            "id": str(idx), "name": name, "mode": "fork",
+            "rc": str(st.get("restart_count", 0)),
+            "status": f"{icon} {status}",
+            "pid": str(st.get("pid") or "—"),
+            "cpu": f"{st.get('cpu', 0)}%",
+            "mem": str(st.get("mem", "—")),
+        })
+    headers = {"id": "id", "name": "name", "mode": "mode", "rc": "↺",
+               "status": "status", "pid": "pid", "cpu": "cpu", "mem": "memory"}
+    cols = list(headers)
+    widths = {c: max([disp_width(headers[c])] + [disp_width(r[c]) for r in rows] or [1]) for c in cols}
+    if not rows:
+        print("no services. use: droiddesk-tower service add <name> <path>")
+        return 0
+    sep = "├" + "┼".join("─" * (widths[c] + 2) for c in cols) + "┤"
+    print("┌" + "┬".join("─" * (widths[c] + 2) for c in cols) + "┐")
+    print("│ " + " │ ".join(pad(headers[c], widths[c]) for c in cols) + " │")
+    print(sep)
+    for r in rows:
+        print("│ " + " │ ".join(pad(r[c], widths[c]) for c in cols) + " │")
+    print("└" + "┴".join("─" * (widths[c] + 2) for c in cols) + "┘")
+    return 0
+
+
+def _service_add(args: list, json_mode: bool) -> int:
+    if len(args) < 2:
+        print("usage: droiddesk-tower service add <name> <path|cmd> [--nginx] [--keep-live] [--start-with-os] [--cwd dir] [--port p]", file=sys.stderr)
+        return 2
+    name, target = args[0], args[1]
+    opts = {"keep_live": False, "start_with_os": False,
+            "start_nginx_with_ubuntu": False, "cwd": "/", "port": None}
+    i = 2
+    while i < len(args):
+        a = args[i]
+        if a in ("--nginx", "-n"):
+            opts["start_nginx_with_ubuntu"] = True; i += 1
+        elif a in ("--keep-live", "-k"):
+            opts["keep_live"] = True; i += 1
+        elif a in ("--start-with-os", "-s"):
+            opts["start_with_os"] = True; i += 1
+        elif a in ("--cwd", "-w") and i + 1 < len(args):
+            opts["cwd"] = args[i + 1]; i += 2
+        elif a in ("--port", "-p") and i + 1 < len(args):
+            opts["port"] = args[i + 1]; i += 2
+        else:
+            i += 1
+    r = api_post("/api/add", {
+        "name": name, "cmd": target, "cwd": opts["cwd"],
+        "keep_live": opts["keep_live"], "start_with_os": opts["start_with_os"],
+        "start_nginx_with_ubuntu": opts["start_nginx_with_ubuntu"],
+    })
+    if not r.get("ok"):
+        print(f"error: {r.get('error')}", file=sys.stderr)
+        return 9 if "exists" in str(r.get("error")) else 1
+    # --nginx: 生成反代 server block
+    if opts["start_nginx_with_ubuntu"] and opts["port"]:
+        _nginx_proxy_block(name, opts["port"])
+    print(f"[{name}] added" + (" + nginx proxy" if opts["start_nginx_with_ubuntu"] else ""))
+    return 0
+
+
+def _nginx_proxy_block(name: str, port: int):
+    conf = f"""# auto-generated by droiddesk-tower for service: {name}
+server {{
+    listen 8088;
+    server_name {name}.tower.local;
+    location / {{
+        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }}
+}}
+"""
+    conf_path = Path(f"/etc/nginx/sites-available/tower-{name}.conf")
+    try:
+        conf_path.write_text(conf)
+        link = Path("/etc/nginx/sites-enabled")
+        link.mkdir(exist_ok=True)
+        lnk = link / f"tower-{name}.conf"
+        if not lnk.exists():
+            os.symlink(conf_path, lnk)
+        sh("nginx -t 2>&1 && nginx -s reload 2>&1")
+        print(f"  nginx proxy: {name}.tower.local:8088 -> 127.0.0.1:{port}")
+    except Exception as e:
+        print(f"  nginx proxy failed: {e}", file=sys.stderr)
+
+
+def _service_config(args: list, json_mode: bool) -> int:
+    if not args:
+        print("usage: droiddesk-tower service config <name> [key=value ...]", file=sys.stderr)
+        return 2
+    name = args[0]
+    conf_file = Path(CONF_DIR, "services.json")
+    try:
+        cfg = json.loads(conf_file.read_text())
+    except Exception as e:
+        print(f"error: config read failed: {e}", file=sys.stderr)
+        return 8
+    svc = next((s for s in cfg.get("services", []) if s.get("name") == name), None)
+    if not svc:
+        print(f"error: service '{name}' not found", file=sys.stderr)
+        return 3
+    if len(args) == 1:
+        if json_mode:
+            print(json.dumps(svc, ensure_ascii=False, indent=2))
+        else:
+            for k, v in svc.items():
+                print(f"{k}: {v}")
+        return 0
+    # key=value 修改
+    for kv in args[1:]:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        if v.lower() in ("true", "false"):
+            v = v.lower() == "true"
+        elif v.isdigit():
+            v = int(v)
+        svc[k] = v
+    conf_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    print(f"[{name}] config updated")
+    return 0
+
+
+# ══ pm2 模块（透传给 tower-pm2 CLI）══════════════════════════
+def cmd_pm2(args: list) -> int:
+    r = subprocess.run(
+        ["python3", f"{TOWER_DIR}/tower-pm2"] + args,
+        capture_output=False,
+    )
+    return r.returncode
+
+
+# ══ 主入口 ═══════════════════════════════════════════════════
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if sys.argv[1] == "--version":
+        print(f"droiddesk-tower {VERSION}")
+        return 0
+
+    module = sys.argv[1]
+    args = sys.argv[2:]
+    handlers = {
+        "panel": cmd_panel,
+        "ssh": cmd_ssh,
+        "nginx": cmd_nginx,
+        "service": cmd_service,
+        "pm2": cmd_pm2,
+    }
+    fn = handlers.get(module)
+    if not fn:
+        print(f"unknown module: {module} (panel|ssh|nginx|service|pm2)", file=sys.stderr)
+        return 2
+    return fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

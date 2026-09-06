@@ -1621,13 +1621,13 @@ class LinuxRuntime(private val context: Context) {
                     "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
                     "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
             val innerCmd = "mkdir -p /run/sshd; " +
-                    // Tower 启动：检查 PID 文件 + kill -0 检测存活
-                    "if [ -f /opt/droiddesk/tower/tower-pm2.py ]; then " +
-                    "TPID=$(cat /run/tower/tower-pm2.pid 2>/dev/null); " +
-                    "if [ -z \"" + "${'$'}TPID" + "\" ] || ! kill -0 \"" + "${'$'}TPID" + "\" 2>/dev/null; then " +
-                    "nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & " +
-                    "disown 2>/dev/null; " +
-                    "fi; fi; " +
+                    // Tower 启动：通过 tower-start 脚本（内部已做端口探测+幂等）
+                    // 用 setsid 让 Tower 脱离 sshd 的进程组，避免被 sshd 退出时连累
+                    "if [ -x /opt/droiddesk/tower/tower-start ]; then " +
+                    "setsid bash /opt/droiddesk/tower/tower-start 7088 </dev/null >/dev/null 2>&1 & " +
+                    "disown 2>/dev/null; fi; " +
+                    // 给 Tower 1 秒启动时间，避免 sshd 先起来让用户早于 Tower 访问
+                    "sleep 1; " +
                     "exec /usr/sbin/sshd -D -e"
             val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
             Log.i(TAG, "startUbuntuSshd: $fullCmd")
@@ -2651,6 +2651,8 @@ exec tail -f /dev/null
                 "tower-start",
                 "tower-stop",
                 "tower-list",
+                "tower-pm2",
+                "droiddesk-tower",
                 "install.sh",
                 "uninstall.sh",
             )
@@ -2660,6 +2662,8 @@ exec tail -f /dev/null
                 "flutter_assets/assets/tower/tower-start",
                 "flutter_assets/assets/tower/tower-stop",
                 "flutter_assets/assets/tower/tower-list",
+                "flutter_assets/assets/tower/tower-pm2",
+                "flutter_assets/assets/tower/droiddesk-tower",
                 "flutter_assets/assets/tower/install.sh",
                 "flutter_assets/assets/tower/uninstall.sh",
             )
@@ -2705,10 +2709,15 @@ exec tail -f /dev/null
             onProgress?.invoke(0.85, "Setting permissions...")
 
             // 3. Verify and chmod + 把 services.json 部署到 /etc/tower/（Tower 运行时读这里）
+            // + 全局 CLI 符号链接（droiddesk-tower / tower-pm2）
             executeCommand(
                 "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
                 "\"chmod 755 /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && " +
                 "cp -f /opt/droiddesk/tower/services.json /etc/tower/services.json && " +
+                "mkdir -p /usr/local/bin && " +
+                "ln -sf /opt/droiddesk/tower/droiddesk-tower /usr/local/bin/droiddesk-tower && " +
+                "ln -sf /opt/droiddesk/tower/tower-pm2 /usr/local/bin/tower-pm2 && " +
+                "chmod +x /opt/droiddesk/tower/droiddesk-tower /opt/droiddesk/tower/tower-pm2 && " +
                 "ls -la /opt/droiddesk/tower /etc/tower\""
             )
 
@@ -2876,6 +2885,24 @@ exec tail -f /dev/null
         }
     }
 
+    /**
+     * Delete a service from Tower registry via HTTP API.
+     */
+    fun towerDeleteService(name: String): Boolean {
+        if (!isTowerInstalled()) return false
+        return try {
+            val encoded = java.net.URLEncoder.encode(name, "UTF-8")
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
+                "'curl -s -X POST http://127.0.0.1:7088/api/delete/$encoded'"
+            val out = executeCommand(cmd)
+            Log.i(TAG, "towerDeleteService($name): $out")
+            out.contains("\"ok\": true")
+        } catch (e: Exception) {
+            Log.e(TAG, "towerDeleteService($name) failed: ${e.message}")
+            false
+        }
+    }
+
     // ── Tower Daemon 控制 ────────────────────────────────────────────────────
 
     fun towerStartDaemon(): Boolean {
@@ -2917,6 +2944,71 @@ exec tail -f /dev/null
         } catch (e: Exception) {
             Log.e(TAG, "towerRestartDaemon failed: ${e.message}")
             false
+        }
+    }
+
+    /**
+     * List services from Tower HTTP API (/api/list).
+     * Returns list of maps: {name, status, pid, cpu, mem, keep_live, start_nginx_with_ubuntu, cmd}
+     */
+    fun towerListServices(): List<Map<String, Any>> {
+        return try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
+                "\"curl -s -m 5 http://127.0.0.1:7088/api/list\""
+            )
+            val json = org.json.JSONObject(out.trim())
+            if (!json.optBoolean("ok", false)) return emptyList()
+            val services = json.optJSONObject("services") ?: return emptyList()
+            val result = mutableListOf<Map<String, Any>>()
+            for (name in services.keys()) {
+                val st = services.getJSONObject(name)
+                result.add(
+                    mapOf(
+                        "name" to name,
+                        "cmd" to st.optString("cmd", ""),
+                        "status" to st.optString("status", "stopped"),
+                        "pid" to (st.optInt("pid", 0)),
+                        "cpu" to (st.optDouble("cpu", 0.0)),
+                        "mem" to st.optString("mem", "-"),
+                        "uptime" to st.optString("uptime", ""),
+                        "restart_count" to st.optInt("restart_count", 0),
+                        "keep_live" to st.optBoolean("keep_live", false),
+                        "start_nginx_with_ubuntu" to st.optBoolean("start_nginx_with_ubuntu", false),
+                    )
+                )
+            }
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "towerListServices failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Get Tower system metrics (/api/system).
+     */
+    fun towerGetSystem(): Map<String, Any> {
+        return try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
+                "\"curl -s -m 5 http://127.0.0.1:7088/api/system\""
+            )
+            val json = org.json.JSONObject(out.trim())
+            val load1 = json.optJSONArray("loadavg")?.optDouble(0) ?: 0.0
+            mapOf(
+                "ok" to json.optBoolean("ok", false),
+                "cpu_cores" to json.optInt("cpu_cores", 0),
+                "load1" to load1,
+                "mem_pct" to json.optDouble("mem_pct", 0.0),
+                "mem_used_gb" to json.optDouble("mem_used_gb", 0.0),
+                "mem_total_gb" to json.optDouble("mem_total_gb", 0.0),
+                "disk_used_gb" to json.optDouble("disk_used_gb", 0.0),
+                "disk_total_gb" to json.optDouble("disk_total_gb", 0.0),
+                "uptime" to json.optString("uptime", ""),
+            )
+        } catch (e: Exception) {
+            mapOf("ok" to false)
         }
     }
 }

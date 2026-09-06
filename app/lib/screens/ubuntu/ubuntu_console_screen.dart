@@ -28,6 +28,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   bool _sshdRunning = false;
   int _sshPort = 22;
   Timer? _statusTimer;
+  bool _scrolling = false;
   bool _statusBusy = false;
 
   // Tower 状态
@@ -37,6 +38,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   bool _installingTower = false;
   double _towerInstallProgress = 0.0;
   String _towerInstallStatus = '';
+  List<Map<String, dynamic>> _towerServices = [];
 
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
@@ -48,7 +50,11 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _load();
-    _statusTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshStatus());
+    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      // 滚动中跳过刷新，避免 ListView 重建打断滚动状态
+      if (_scrolling) return;
+      _refreshStatus();
+    });
   }
 
   @override
@@ -103,6 +109,13 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
           _towerInstalled = ts['installed'] as bool? ?? _towerInstalled;
           _towerRunning = ts['running'] as bool? ?? _towerRunning;
         });
+        // Tower 在跑时拉服务列表
+        if (_towerRunning) {
+          final svcs = await DroidDeskPlatform.getTowerServices();
+          if (mounted) setState(() => _towerServices = svcs);
+        } else if (mounted) {
+          setState(() => _towerServices = []);
+        }
       } catch (_) {}
     } finally {
       _statusBusy = false;
@@ -310,9 +323,137 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     await _refreshStatus();
   }
 
+  Future<void> _towerSvcAction(String name, String action) async {
+    final messenger = ScaffoldMessenger.of(context);
+    bool ok = false;
+    if (action == 'start') {
+      ok = await DroidDeskPlatform.startTowerService(name);
+    } else if (action == 'stop') {
+      ok = await DroidDeskPlatform.stopTowerService(name);
+    } else {
+      ok = await DroidDeskPlatform.restartTowerService(name);
+    }
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? '$name $action ok' : '$name $action failed'),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
+  }
+
+  Future<void> _towerSvcDelete(String name) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $name?'),
+        content: Text('进程将被停止并从 Tower 注册表中移除。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: DroidTheme.error),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    // delete = stop + 从 services.json 移除，通过 Tower API
+    // 复用 stopTowerService 后由 Tower CLI/API 删除；这里通过 restart bridge 不可行，
+    // 直接用 platform 的 deleteTowerService（如果存在）；否则先 stop
+    final ok = await DroidDeskPlatform.deleteTowerService(name);
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? '$name deleted' : '$name delete failed'),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
+  }
+
   Future<void> _openTowerWeb() async {
     final port = int.tryParse(_towerPortCtrl.text.trim()) ?? _towerPort;
     await DroidDeskPlatform.openUrl('http://127.0.0.1:$port');
+  }
+
+  // Tower Service 行构造（独立函数，避免 Column+for 嵌套在 _refreshStatus
+  // setState 时的反复重建干扰主 ListView 滚动状态）
+  List<Widget> _buildServiceRows() {
+    final rows = <Widget>[];
+    for (var i = 0; i < _towerServices.length; i++) {
+      final svc = _towerServices[i];
+      final name = svc['name'] as String? ?? '';
+      final isOnline = svc['status'] == 'online';
+      final pid = svc['pid'] ?? '-';
+      final mem = svc['mem'] ?? '-';
+      final cpu = svc['cpu'] ?? 0;
+      final rc = svc['restart_count'] as int? ?? 0;
+      rows.add(
+        Container(
+          padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+          child: Row(
+            children: [
+              Icon(
+                Icons.circle_rounded,
+                size: 12,
+                color: isOnline ? DroidTheme.success : DroidTheme.textSecondary,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      name,
+                      style: DroidTheme.bodyMd.copyWith(fontWeight: FontWeight.w600),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'pid $pid · $mem · cpu $cpu%${rc > 0 ? ' · restarts $rc' : ''}',
+                      style: DroidTheme.bodySm,
+                    ),
+                  ],
+                ),
+              ),
+              if (isOnline)
+                IconButton(
+                  icon: const Icon(Icons.refresh_rounded, size: 20),
+                  tooltip: 'Restart',
+                  onPressed: () => _towerSvcAction(name, 'restart'),
+                ),
+              if (isOnline)
+                IconButton(
+                  icon: const Icon(Icons.stop_circle_outlined, size: 20),
+                  tooltip: 'Stop',
+                  onPressed: () => _towerSvcAction(name, 'stop'),
+                ),
+              if (!isOnline)
+                IconButton(
+                  icon: const Icon(Icons.play_circle_outline_rounded, size: 20),
+                  tooltip: 'Start',
+                  onPressed: () => _towerSvcAction(name, 'start'),
+                ),
+              IconButton(
+                icon: const Icon(Icons.delete_outline_rounded,
+                    size: 20, color: DroidTheme.error),
+                tooltip: 'Delete',
+                onPressed: () => _towerSvcDelete(name),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (i < _towerServices.length - 1) {
+        rows.add(const Divider(height: 1, color: DroidTheme.surfaceBorder));
+      }
+    }
+    return rows;
   }
 
   @override
@@ -320,14 +461,19 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     final state = context.watch<AppState>();
     return Scaffold(
       appBar: AppBar(title: const Text('Ubuntu Console')),
+      // 用 SingleChildScrollView + Column 替代 ListView —— 内容约 3000px，
+      // 不会触发 ListView 虚拟化+频繁 rebuild 引起的滚动条重置 bug
       body: Container(
         decoration: const BoxDecoration(
           gradient: DroidTheme.backgroundGradient,
         ),
         child: _loading
             ? const Center(child: CircularProgressIndicator())
-            : ListView(
+            : SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
+                child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   // Header info
                   Container(
@@ -650,6 +796,24 @@ const SizedBox(height: 16),
                     ),
                   ),
 
+                  // Tower Services（tower pm2 托管的进程列表）
+                  if (_towerInstalled && _towerServices.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    Text('TOWER PM2 · SERVICES', style: DroidTheme.label),
+                    const SizedBox(height: 8),
+                    Container(
+                      decoration: BoxDecoration(
+                        color: DroidTheme.cardBg,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: DroidTheme.surfaceBorder),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: _buildServiceRows(),
+                      ),
+                    ),
+                  ],
+
                   const SizedBox(height: 20),
 
                   // Credentials
@@ -709,6 +873,7 @@ const SizedBox(height: 16),
                     ),
                   ),
                 ],
+                ),
               ),
       ),
     );

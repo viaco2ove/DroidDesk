@@ -329,6 +329,12 @@ class DroidDeskPlatform {
     return r ?? false;
   }
 
+  /// Delete a service from Tower registry (stop + remove).
+  static Future<bool> deleteTowerService(String name) async {
+    final r = await _channel.invokeMethod<bool>('deleteTowerService', {'name': name});
+    return r ?? false;
+  }
+
   /// Open an external URL in the system browser / handler.
   static Future<bool> openUrl(String url) async {
     final r = await _channel.invokeMethod<bool>('openUrl', {'url': url});
@@ -353,5 +359,28 @@ class DroidDeskPlatform {
   static Future<bool> restartTower() async {
     final r = await _channel.invokeMethod<bool>('restartTower');
     return r ?? false;
+  }
+
+  /// List services from Tower HTTP API.
+  static Future<List<Map<String, dynamic>>> getTowerServices() async {
+    try {
+      final r = await _channel.invokeMethod<List<dynamic>>('getTowerServices');
+      return (r ?? [])
+          .whereType<Map<dynamic, dynamic>>()
+          .map((m) => Map<String, dynamic>.from(m))
+          .toList();
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /// Get Tower system metrics.
+  static Future<Map<String, dynamic>> getTowerSystem() async {
+    try {
+      final r = await _channel.invokeMethod<Map<dynamic, dynamic>>('getTowerSystem');
+      return Map<String, dynamic>.from(r ?? {});
+    } catch (e) {
+      return {'ok': false};
+    }
   }
 }

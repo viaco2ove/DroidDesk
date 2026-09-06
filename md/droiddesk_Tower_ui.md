@@ -20,7 +20,7 @@ save
 ### nginx [switch]
 ### nginx [restart]
 
-## service
+## service（不是tower pm2！！！）
 add/delete
 每个python服务：[name][path][start nginx with Ubuntu swtich] [keep live swtich]
 例如 Toonflow 管理页

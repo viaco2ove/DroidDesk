@@ -24,7 +24,7 @@ import logging
 import threading
 import psutil
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
@@ -54,6 +54,7 @@ log = logging.getLogger("tower-pm2")
 services: dict = {}          # name -> { pid, status, restart_count, last_restart, ... }
 services_lock = threading.Lock()
 shutdown_event = threading.Event()
+user_stopped: set = set()    # 用户显式 stop 的服务名 —— keep_live 看门狗不拉起这些
 
 # ── 配置读写 ───────────────────────────────────────────────
 def load_config() -> dict:
@@ -202,6 +203,9 @@ def start_service(name: str) -> dict:
     log_err = svc_cfg.get("stderr_log", f"{DEFAULT_LOGDIR}/{name}.err.log")
     os.makedirs(os.path.dirname(log_out), exist_ok=True)
 
+    # 显式 start 清除用户停止意图，看门狗恢复保护
+    user_stopped.discard(name)
+
     try:
         log.info("starting: %s  cmd=%s", name, cmd)
         proc = subprocess.Popen(
@@ -228,39 +232,124 @@ def start_service(name: str) -> dict:
         log.error("start %s failed: %s", name, e)
         return {"ok": False, "error": str(e)}
 
+def _find_service_children(pid: int) -> list:
+    """递归收集 pid 的所有后代（读 /proc/<pid>/task/*/children）"""
+    kids = []
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            for tok in f.read().split():
+                cp = int(tok)
+                kids.append(cp)
+                kids.extend(_find_service_children(cp))
+    except Exception:
+        pass
+    return kids
+
+
+def _match_service_pids(name: str, svc_cmd: str) -> list:
+    """兜底：在 /proc 里按命令特征找该服务的所有进程（含历史孤儿）。
+    判定标准：cmdline 含 cmd 的核心特征（如 build/app.js 路径），
+    且不是 shell wrapper（/bin/sh -c）、不是 tower-pm2 自己。
+    """
+    # 取 cmd 里的路径特征（最后一个带 / 的参数）
+    key = None
+    for tok in svc_cmd.split():
+        if "/" in tok and not tok.startswith("-") and not tok.startswith("NODE_ENV"):
+            key = tok
+    if not key:
+        return []
+    found = []
+    try:
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            pid = int(d.name)
+            if pid == os.getpid():
+                continue
+            cl = cmdline_of(pid)
+            if not cl or key not in cl:
+                continue
+            # 排除 sh -c wrapper（它的 cmdline 同时含 key 和 "-c"）
+            if cl.strip().startswith("/bin/sh -c") or cl.strip().startswith("sh -c"):
+                continue
+            # 排除 tower-pm2 自身相关
+            if "tower-pm2" in cl:
+                continue
+            found.append(pid)
+    except Exception:
+        pass
+    return found
+
+
 def stop_service(name: str, force: bool = False) -> dict:
+    """停服务：杀整个进程树 + /proc 特征兜底扫孤儿。
+    只杀 PID 文件里那个 shell wrapper 会让 node 子进程被孤立 —— 这是
+    「杀一个又冒一个、怎么都关不掉」的根因。
+    """
+    cfg = load_config()
+    svc_cfg = next((s for s in cfg.get("services", []) if s.get("name") == name), None)
+    svc_cmd = (svc_cfg or {}).get("cmd", "")
+
+    # 1) 登记用户停止意图（看门狗不拉起）+ 更新状态
+    user_stopped.add(name)
+    with services_lock:
+        services[name] = {**services.get(name, {}), "status": "stopped", "pid": None}
+
+    # 2) 收集要杀的 PID：PID 文件 + 其后代 + /proc 特征匹配的孤儿
+    victims = set()
     pid = read_pid(name)
-    if not pid or not pid_exists(pid):
+    if pid and pid_exists(pid):
+        victims.add(pid)
+        victims.update(_find_service_children(pid))
+    victims.update(_match_service_pids(name, svc_cmd))
+
+    if not victims:
         clear_pid(name)
         with services_lock:
             services.pop(name, None)
         return {"ok": True, "message": "not running"}
 
-    try:
-        log.info("stopping: %s (PID %d, force=%s)", name, pid, force)
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        os.kill(pid, sig)
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    log.info("stopping: %s force=%s pids=%s", name, force, sorted(victims))
+    for v in victims:
+        try:
+            os.kill(v, sig)
+        except Exception:
+            pass
 
-        # 等待退出
-        for i in range(20):   # 最多 10s
-            if not pid_exists(pid):
-                break
-            time.sleep(0.5)
+    # 3) 等待退出（最多 6s），仍活着就 SIGKILL
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        alive = [v for v in victims if pid_exists(v)]
+        if not alive:
+            break
+        time.sleep(0.5)
+    # 第二轮：把幸存者 + 新扫出的孤儿（含 node cluster worker）全部 SIGKILL
+    victims.update(_match_service_pids(name, svc_cmd))
+    for v in list(victims):
+        if pid_exists(v):
+            try:
+                os.kill(v, signal.SIGKILL)
+            except Exception:
+                pass
+            # 同时杀进程组（start_new_session 使 wrapper 为组长，cluster worker 在同组）
+            try:
+                os.killpg(os.getpgid(v), signal.SIGKILL)
+            except Exception:
+                pass
+    # 第三轮：多次扫描漏网的（杀组后可能残留的独立 worker / 延迟孤儿）
+    for _ in range(3):
+        time.sleep(1)
+        for v in _match_service_pids(name, svc_cmd):
+            try:
+                os.kill(v, signal.SIGKILL)
+            except Exception:
+                pass
 
-        if pid_exists(pid):
-            os.kill(pid, signal.SIGKILL)
-            time.sleep(0.5)
-
-        clear_pid(name)
-        with services_lock:
-            services.pop(name, None)
-        return {"ok": True, "message": "stopped"}
-    except Exception as e:
-        log.error("stop %s failed: %s", name, e)
-        clear_pid(name)
-        with services_lock:
-            services.pop(name, None)
-        return {"ok": False, "error": str(e)}
+    clear_pid(name)
+    with services_lock:
+        services.pop(name, None)
+    return {"ok": True, "message": "stopped"}
 
 def restart_service(name: str) -> dict:
     stop_service(name, force=True)
@@ -322,6 +411,9 @@ def watchdog_loop() -> None:
         for svc in svc_list:
             name = svc.get("name", "")
             if not svc.get("keep_live", False):
+                continue
+            # 用户显式 stop 过的服务：看门狗绝不拉起（直到显式 start）
+            if name in user_stopped:
                 continue
 
             pid = read_pid(name)
@@ -401,178 +493,308 @@ def refresh_all() -> None:
 
 # ── Web UI ─────────────────────────────────────────────────
 def build_html() -> str:
-    cfg = load_config()
-    svc_list = cfg.get("services", [])
+    """宝塔风格 Web UI：open-server / nginx / service / tower-pm2 四模块"""
     refresh_all()
+    return _UI_TEMPLATE
 
-    rows = ""
-    for svc in svc_list:
-        name = svc.get("name", "")
-        with services_lock:
-            st = services.get(name, {})
-        status = st.get("status", "unknown")
-        pid     = st.get("pid", "—")
-        cpu     = st.get("cpu", 0)
-        mem     = st.get("mem", "—")
-        uptime  = st.get("uptime", "—")
-        rc      = st.get("restart_count", 0)
-        kl      = svc.get("keep_live", False)
-        sw      = svc.get("start_nginx_with_ubuntu", False)
 
-        color = {"online": "#27c93f", "stopped": "#ff5f56", "crash_loop": "#ffbd2e"}.get(status, "#888")
-        rows += f"""
-        <tr>
-          <td>{name}</td>
-          <td><span class="dot" style="background:{color}"></span>{status}</td>
-          <td>{pid if pid else '—'}</td>
-          <td>{uptime}</td>
-          <td>{cpu}%</td>
-          <td>{mem}</td>
-          <td>{rc}</td>
-          <td>
-            <button class="btn-icon" onclick="action('start','{name}')" title="启动">&#9654;</button>
-            <button class="btn-icon" onclick="action('stop','{name}')"  title="停止">&#9632;</button>
-            <button class="btn-icon" onclick="action('restart','{name}')" title="重启">&#8635;</button>
-            <button class="btn-icon btn-del" onclick="action('delete','{name}')" title="删除">&#10005;</button>
-          </td>
-        </tr>"""
-
-    return f"""<!DOCTYPE html>
+_UI_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DroidDesk Tower — 安全高效的服务器运维面板</title>
+<title>DroidDesk Tower</title>
 <style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#333}}
-.header{{background:#2c3e50;color:#fff;padding:16px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}}
-.header h1{{font-size:18px;font-weight:600}}
-.header .badge{{background:#e95420;padding:2px 8px;border-radius:4px;font-size:12px}}
-.toolbar{{padding:12px 24px;background:#fff;border-bottom:1px solid #e0e0e0;display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
-.toolbar input{{padding:6px 10px;border:1px solid #ccc;border-radius:4px;width:200px}}
-.toolbar input:focus{{outline:none;border-color:#e95420}}
-.btn{{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px}}
-.btn-primary{{background:#e95420;color:#fff}}
-.btn-primary:hover{{background:#c44a1c}}
-.btn-secondary{{background:#f0f0f0;color:#333}}
-.btn-secondary:hover{{background:#e0e0e0}}
-.main{{padding:16px 24px}}
-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:6px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
-th{{background:#f8f9fa;padding:10px 12px;text-align:left;font-size:13px;color:#666;border-bottom:1px solid #eee}}
-td{{padding:10px 12px;font-size:13px;border-bottom:1px solid #f5f5f5}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:#fafafa}}
-.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}}
-.btn-icon{{padding:4px 8px;margin:0 2px;border:1px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;font-size:13px}}
-.btn-icon:hover{{background:#f0f0f0}}
-.btn-del{{color:#e95420}}
-.btn-del:hover{{background:#fff0ee}}
-.msg{{padding:10px 24px;font-size:13px;border-radius:4px;margin-bottom:12px;display:none}}
-.msg.ok{{background:#d4edda;color:#155724;display:block}}
-.msg.err{{background:#f8d7da;color:#721c24;display:block}}
-.footer{{text-align:center;color:#999;font-size:12px;padding:16px}}
-#addModal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center}}
-#addModal.show{{display:flex}}
-.modal{{background:#fff;border-radius:8px;padding:24px;width:420px;max-width:95vw}}
-.modal h3{{margin-bottom:16px;font-size:16px}}
-.form-group{{margin-bottom:12px}}
-.form-group label{{display:block;font-size:13px;color:#666;margin-bottom:4px}}
-.form-group input[type=text]{{width:100%;padding:6px 10px;border:1px solid #ccc;border-radius:4px}}
-.form-group input[type=checkbox]{{margin-right:4px}}
-.form-row{{display:flex;gap:8px}}
+:root{--bg:#f4f6f9;--card:#fff;--txt:#333;--sub:#8a94a6;--bd:#e6eaf0;--pri:#20a0ff;--ok:#27c93f;--warn:#ffbd2e;--err:#ff5f56;--orange:#e95420}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--txt);font-size:14px}
+.header{background:linear-gradient(135deg,#243447,#2c3e50);color:#fff;padding:14px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.header h1{font-size:18px;font-weight:600;letter-spacing:.5px}
+.header .badge{background:var(--orange);padding:2px 10px;border-radius:10px;font-size:12px}
+.sysbar{display:flex;gap:18px;margin-left:auto;font-size:12px;opacity:.9;flex-wrap:wrap}
+.sysbar b{color:#7fd0ff;font-weight:600}
+.wrap{max-width:1080px;margin:16px auto;padding:0 16px;display:grid;gap:16px}
+.card{background:var(--card);border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.06);overflow:hidden}
+.card>.hd{padding:12px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.card>.hd h2{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+.card>.hd .sp{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.card>.bd{padding:16px 18px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+.dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot.off{background:#c3cbd6}
+.sw{position:relative;display:inline-block;width:44px;height:24px}
+.sw input{opacity:0;width:0;height:0}
+.sl{position:absolute;cursor:pointer;inset:0;background:#c3cbd6;border-radius:24px;transition:.25s}
+.sl:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.25s}
+input:checked+.sl{background:var(--pri)}
+input:checked+.sl:before{transform:translateX(20px)}
+.sw.disabled{opacity:.5;pointer-events:none}
+.btn{padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;background:#eef1f5;color:#444}
+.btn:hover{background:#e2e7ee}
+.btn-pri{background:var(--pri);color:#fff}
+.btn-ok{background:var(--ok);color:#fff}
+.btn-warn{background:var(--warn);color:#fff}
+.btn-err{background:var(--err);color:#fff}
+.btn-sm{padding:4px 10px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:12px;color:var(--sub)}
+.field input{padding:7px 10px;border:1px solid var(--bd);border-radius:5px;font-size:13px;min-width:130px}
+.field input:focus{outline:none;border-color:var(--pri)}
+.formrow{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+table{width:100%;border-collapse:collapse}
+th{background:#f8fafc;padding:9px 12px;text-align:left;font-size:12px;color:var(--sub);border-bottom:1px solid var(--bd);white-space:nowrap}
+td{padding:9px 12px;font-size:13px;border-bottom:1px solid #f2f5f8;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafcfe}
+.empty{text-align:center;color:var(--sub);padding:26px}
+#toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);padding:10px 22px;border-radius:6px;color:#fff;font-size:13px;display:none;z-index:99;box-shadow:0 4px 14px rgba(0,0,0,.2)}
+#toast.ok{background:#27c93f}#toast.err{background:#ff5f56}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90;align-items:center;justify-content:center}
+#modal.show{display:flex}
+.mbox{background:#fff;border-radius:10px;padding:22px;width:430px;max-width:92vw}
+.mbox h3{font-size:15px;margin-bottom:14px}
+.mbox .field{margin-bottom:12px}
+.mbox .field input{width:100%}
+.mfoot{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.chk{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;margin:8px 0}
+.chk label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.sec-desc{font-size:12px;color:var(--sub);margin-top:2px}
+@media(max-width:640px){.sysbar{display:none}.field input{min-width:100px}}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>DroidDesk Tower</h1>
-  <span class="badge">安全高效的服务器运维面板</span>
-  <span style="margin-left:auto;font-size:13px;opacity:.8">端口 {DEFAULT_PORT}</span>
+  <h1>DroidDesk Tower</h1><span class="badge">安全高效的服务器运维面板</span>
+  <div class="sysbar" id="sysbar"></div>
 </div>
 
-<div class="toolbar">
-  <button class="btn btn-primary" onclick="showAdd()">+ 添加服务</button>
-  <button class="btn btn-secondary" onclick="action('refresh','')">刷新</button>
-  <span style="margin-left:auto;font-size:13px;color:#888">
-    {len(svc_list)} 服务 · {sum(1 for s in svc_list if services.get(s.get('name',''),{}).get('status')=='online')} 在线
-  </span>
-</div>
+<div class="wrap">
 
-<div id="msg" class="msg"></div>
-
-<div class="main">
-<table>
-<thead>
-<tr>
-  <th>名称</th><th>状态</th><th>PID</th><th>运行时长</th><th>CPU</th><th>内存</th><th>重启次数</th><th>操作</th>
-</tr>
-</thead>
-<tbody>{rows if rows else '<tr><td colspan="8" style="text-align:center;color:#999;padding:24px">暂无服务，添加一个试试</td></tr>'}
-</tbody>
-</table>
-</div>
-
-<div id="addModal">
-  <div class="modal">
-    <h3>添加服务</h3>
-    <div class="form-group"><label>服务名称</label><input id="m-name" placeholder="如：toonflow-game"></div>
-    <div class="form-group"><label>启动命令</label><input id="m-cmd" placeholder="如：cd /opt/toonflow && python3 -m panel"></div>
-    <div class="form-group"><label>工作目录</label><input id="m-cwd" placeholder="如：/opt/toonflow（默认 /）"></div>
-    <div class="form-group form-row">
-      <label><input type="checkbox" id="m-keep"> 保活（异常自动重启）</label>
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="ssh-dot"></span>Open-Server (SSH)</h2>
+    <div class="sp">
+      <span id="ssh-port-badge" style="font-size:12px;color:var(--sub)"></span>
+      <label class="sw"><input type="checkbox" id="ssh-sw" onchange="sshToggle(this.checked)"><span class="sl"></span></label>
     </div>
-    <div class="form-group form-row">
-      <label><input type="checkbox" id="m-nginx"> 随 Ubuntu 启动 Nginx</label>
+  </div>
+  <div class="bd">
+    <div class="sec-desc">sshd will run as long as Ubuntu is running</div>
+    <div style="height:12px"></div>
+    <div class="formrow">
+      <div class="field"><label>Username</label><input id="ssh-user" value="root"></div>
+      <div class="field"><label>Password</label><input id="ssh-pass" type="password" placeholder="********"></div>
+      <div class="field"><label>SSH Port</label><input id="ssh-port" value="8122" style="width:90px"></div>
+      <button class="btn btn-pri" onclick="sshSave()">Save</button>
     </div>
-    <div style="margin-top:16px;display:flex;gap:8px">
-      <button class="btn btn-primary" onclick="doAdd()">确认添加</button>
-      <button class="btn btn-secondary" onclick="hideAdd()">取消</button>
-    </div>
+    <div class="sec-desc" style="margin-top:8px">Credentials + SSH port applied inside Ubuntu on save</div>
   </div>
 </div>
 
-<div class="footer">DroidDesk Tower · {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="ng-dot"></span>Nginx</h2>
+    <div class="sp">
+      <button class="btn btn-sm" onclick="ngAct('nginx-restart')">Restart</button>
+      <label class="sw"><input type="checkbox" id="ng-sw" onchange="ngAct(this.checked?'nginx-start':'nginx-stop')"><span class="sl"></span></label>
+    </div>
+  </div>
+  <div class="bd"><div class="sec-desc">Nginx Web 服务器 - 反向代理 / 静态站点</div></div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="sv-dot"></span>Service</h2>
+    <div class="sp"><button class="btn btn-pri btn-sm" onclick="showAdd()">+ 添加服务</button></div>
+  </div>
+  <div class="bd" style="padding:0;overflow-x:auto">
+    <table>
+      <thead><tr><th>name</th><th>path</th><th>start nginx</th><th>keep live</th><th>status</th><th style="text-align:right">funs</th></tr></thead>
+      <tbody id="svc-body"><tr><td colspan="6" class="empty">loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2><span class="dot on" id="pm2-dot"></span>Tower PM2</h2>
+    <div class="sp">
+      <button class="btn btn-sm" onclick="pm2Restart()">Restart</button>
+      <label class="sw"><input type="checkbox" id="pm2-sw" checked onchange="pm2Toggle(this.checked)"><span class="sl"></span></label>
+    </div>
+  </div>
+  <div class="bd">
+    <div class="sec-desc">解决 pm2 多 pid 混乱的问题 - 单例守护，多入口看到的进程列表完全一致</div>
+    <div style="height:12px"></div>
+    <table>
+      <thead><tr><th>id</th><th>name</th><th>mode</th><th>&#8635;</th><th>status</th><th>cpu</th><th>memory</th><th style="text-align:right">funs</th></tr></thead>
+      <tbody id="pm2-body"><tr><td colspan="8" class="empty">loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+</div>
+
+<div id="toast"></div>
+
+<div id="modal"><div class="mbox">
+  <h3>添加服务</h3>
+  <div class="field"><label>name（服务名）</label><input id="m-name" placeholder="如 Toonflow 管理页"></div>
+  <div class="field"><label>path（启动脚本/命令）</label><input id="m-path" placeholder="/opt/toonflow/panel/start-panel.sh"></div>
+  <div class="chk">
+    <label><input type="checkbox" id="m-nginx"> start nginx with Ubuntu</label>
+    <label><input type="checkbox" id="m-keep" checked> keep live</label>
+  </div>
+  <div class="mfoot">
+    <button class="btn" onclick="hideAdd()">取消</button>
+    <button class="btn btn-pri" onclick="doAdd()">添加</button>
+  </div>
+</div></div>
 
 <script>
-let msgTimer=null;
-function showMsg(txt,ok=true){{
-  const el=document.getElementById('msg');
-  el.textContent=txt; el.className='msg '+(ok?'ok':'err');
-  clearTimeout(msgTimer); msgTimer=setTimeout(()=>{{el.style.display='none'}},4000);
-}}
-async function action(act,name){{
-  const r=await fetch('/api/'+act+(name?'/'+name:''),{{method:'POST'}});
-  const j=await r.json();
-  showMsg(j.error||j.message||(j.ok?'操作成功':'操作失败'),j.ok);
-  setTimeout(()=>location.reload(),600);
-}}
-function showAdd(){{document.getElementById('addModal').classList.add('show');}}
-function hideAdd(){{document.getElementById('addModal').classList.remove('show');}}
-async function doAdd(){{
+let toastTimer=null;
+function toast(msg,ok=true){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.className=ok?'ok':'err'; el.style.display='block';
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.style.display='none',2600);
+}
+async function api(path,method='GET',body=null){
+  try{
+    const opt={method,headers:{'Content-Type':'application/json'}};
+    if(body)opt.body=JSON.stringify(body);
+    const r=await fetch(path,opt);
+    return await r.json();
+  }catch(e){return{ok:false,error:String(e)}}
+}
+async function refresh(){
+  const[ssh,ng,list,sys]=await Promise.all([
+    api('/api/ssh/status'),api('/api/nginx/status'),api('/api/list'),api('/api/system')
+  ]);
+  document.getElementById('ssh-sw').checked=!!ssh.running;
+  document.getElementById('ssh-port').value=ssh.port||8122;
+  setDot('ssh-dot',ssh.running);
+  document.getElementById('ssh-port-badge').textContent='port '+(ssh.port||8122);
+  document.getElementById('ng-sw').checked=!!ng.running;
+  setDot('ng-dot',ng.running);
+  renderSvc(list.services||{});
+  renderPm2(list.services||{});
+  document.getElementById('pm2-sw').checked=true;
+  setDot('pm2-dot',true);
+  if(sys.ok){
+    document.getElementById('sysbar').innerHTML=
+      '<span>load <b>'+(sys.loadavg[0]||0).toFixed(1)+'</b></span>'+
+      '<span>mem <b>'+sys.mem_pct+'%</b></span>'+
+      '<span>disk <b>'+Math.round(sys.disk_used_gb)+'/'+Math.round(sys.disk_total_gb)+'GB</b></span>'+
+      '<span>up <b>'+sys.uptime+'</b></span>';
+  }
+}
+function setDot(id,on){const el=document.getElementById(id);el.className='dot '+(on?'on':'off')}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function renderSvc(svc){
+  const tb=document.getElementById('svc-body');
+  const names=Object.keys(svc).filter(function(n){return n!=='sshd'});
+  if(!names.length){tb.innerHTML='<tr><td colspan="6" class="empty">暂无服务，点击右上角 + 添加</td></tr>';return}
+  tb.innerHTML=names.map(function(n){
+    const s=svc[n];
+    const on=s.status==='online';
+    return '<tr>'+
+      '<td><b>'+esc(n)+'</b></td>'+
+      '<td style="color:var(--sub);max-width:260px;overflow:hidden;text-overflow:ellipsis">'+esc(s.cmd||'')+'</td>'+
+      '<td>'+(s.start_nginx_with_ubuntu?'yes':'-')+'</td>'+
+      '<td>'+(s.keep_live?'yes':'-')+'</td>'+
+      '<td><span class="dot '+(on?'on':'off')+'"></span>'+esc(s.status)+'</td>'+
+      '<td style="text-align:right">'+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="svcAct(\''+esc(n)+'\',\''+(on?'stop':'start')+'\')">'+(on?'stop':'start')+'</button>'+
+        '<button class="btn btn-sm" onclick="svcAct(\''+esc(n)+'\',\'restart\')">restart</button>'+
+        '<button class="btn btn-sm btn-err" onclick="svcDel(\''+esc(n)+'\')">delete</button>'+
+      '</td></tr>';
+  }).join('');
+}
+function renderPm2(svc){
+  const tb=document.getElementById('pm2-body');
+  const names=Object.keys(svc).sort();
+  if(!names.length){tb.innerHTML='<tr><td colspan="8" class="empty">无受管进程</td></tr>';return}
+  tb.innerHTML=names.map(function(n,i){
+    const s=svc[n];
+    const on=s.status==='online';
+    return '<tr>'+
+      '<td>'+i+'</td><td><b>'+esc(n)+'</b></td><td>fork</td><td>'+(s.restart_count||0)+'</td>'+
+      '<td><span class="dot '+(on?'on':'off')+'"></span>'+(on?'online':'stopped')+'</td>'+
+      '<td>'+(s.cpu||0)+'%</td><td>'+esc(s.mem||'-')+'</td>'+
+      '<td style="text-align:right">'+
+        '<button class="btn btn-sm" onclick="svcAct(\''+esc(n)+'\',\'restart\')">&#8635;</button>'+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="svcAct(\''+esc(n)+'\',\''+(on?'stop':'start')+'\')">'+(on?'&#9632;':'&#9654;')+'</button>'+
+        '<button class="btn btn-sm btn-err" onclick="svcDel(\''+esc(n)+'\')">&#10005;</button>'+
+      '</td></tr>';
+  }).join('');
+}
+async function sshToggle(on){
+  const r=await api('/api/'+(on?'ssh-start':'ssh-stop'),'POST');
+  toast(r.ok?(on?'sshd started':'sshd stopped'):r.error,r.ok);
+  refresh();
+}
+async function sshSave(){
+  const r=await api('/api/ssh-set-cred','POST',{
+    user:document.getElementById('ssh-user').value,
+    password:document.getElementById('ssh-pass').value,
+    port:document.getElementById('ssh-port').value
+  });
+  document.getElementById('ssh-pass').value='';
+  toast(r.ok?(r.message||'saved'):r.error,r.ok);
+  refresh();
+}
+async function ngAct(act){
+  const r=await api('/api/'+act,'POST');
+  toast(r.ok?(r.message||'done'):r.error,r.ok);
+  refresh();
+}
+async function svcAct(name,act){
+  const r=await api('/api/'+act+'/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' '+act+' ok'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function svcDel(name){
+  if(!confirm('删除服务 '+name+'？进程将被停止并移除注册'))return;
+  const r=await api('/api/delete/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' deleted'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function pm2Toggle(on){
+  if(on){ toast('tower-pm2 already running'); return; }
+  if(!confirm('停止 Tower PM2？所有受管服务（含 toonflow-game）将被停止')){ refresh(); return; }
+  toast('stopping tower-pm2...');
+  await api('/api/pm2-stop','POST');
+  // 服务端会杀掉自身，页面 1.2s 后跳到提示页
+  setTimeout(()=>{ document.body.innerHTML='<div style="padding:40px;text-align:center;color:#888">Tower PM2 已停止。<br><br><a href="/" style="color:#20a0ff">重新启动面板</a>（或执行 bash /opt/droiddesk/tower/tower-start 7088）</div>'; },1200);
+}
+async function pm2Restart(){
+  const r=await api('/api/refresh','POST');
+  toast('tower-pm2 refreshed',r.ok);
+  refresh();
+}
+function showAdd(){document.getElementById('modal').classList.add('show')}
+function hideAdd(){document.getElementById('modal').classList.remove('show')}
+async function doAdd(){
   const name=document.getElementById('m-name').value.trim();
-  const cmd=document.getElementById('m-cmd').value.trim();
-  if(!name||!cmd){{showMsg('名称和命令不能为空',false);return;}}
-  const r=await fetch('/api/add',{{
-    method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{
-      name, cmd,
-      cwd:document.getElementById('m-cwd').value.trim()||'/',
-      keep_live:document.getElementById('m-keep').checked,
-      start_nginx_with_ubuntu:document.getElementById('m-nginx').checked,
-    }})
-  }});
-  const j=await r.json();
-  if(j.ok){{hideAdd();showMsg('添加成功');setTimeout(()=>location.reload(),600);}}
-  else showMsg(j.error||'添加失败',false);
-}}
+  const path=document.getElementById('m-path').value.trim();
+  if(!name||!path){toast('name 和 path 必填',false);return}
+  const r=await api('/api/add','POST',{
+    name,path,
+    keep_live:document.getElementById('m-keep').checked,
+    start_nginx_with_ubuntu:document.getElementById('m-nginx').checked
+  });
+  if(r.ok){hideAdd();toast('已添加 '+name);setTimeout(refresh,600)}
+  else toast(r.error,false);
+}
+refresh();
+setInterval(refresh,5000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-# ── HTTP Handler ───────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    # HTTP/1.0 (默认): 短连接, 每 POST 完整收发后关闭 —— 规避 proot 下
+    # HTTP/1.1 keep-alive 的 POST body/Content-Length 状态错乱
+    timeout = 30
+    timeout = 30  # 单请求最长 30s，防止阻塞线程池
 
     def log_message(self, fmt, *args):
         pass  # 静默，默认会 print 到 stderr
@@ -598,6 +820,12 @@ class Handler(BaseHTTPRequestHandler):
             refresh_all()
             with services_lock:
                 self.send_json({"ok": True, "services": dict(services)})
+            return
+        if path == "/api/ssh/status":
+            self.send_json(_ssh_status())
+            return
+        if path == "/api/nginx/status":
+            self.send_json(_nginx_status())
             return
         if path == "/api/system":
             try:
@@ -631,11 +859,21 @@ class Handler(BaseHTTPRequestHandler):
 
         handlers = {
             "start":    lambda: start_service(name)   if name else {"ok": False, "error": "name required"},
-            "stop":     lambda: stop_service(name)    if name else {"ok": False, "error": "name required"},
+            "stop":     lambda: stop_service(name, force=True)    if name else {"ok": False, "error": "name required"},
             "restart":  lambda: restart_service(name) if name else {"ok": False, "error": "name required"},
             "delete":   lambda: delete_service(name)  if name else {"ok": False, "error": "name required"},
             "refresh":  lambda: (refresh_all(), {"ok": True, "message": "refreshed"}),
             "add":      self._handle_add,
+            # ssh 模块
+            "ssh-start":    lambda: _ssh_toggle(True),
+            "ssh-stop":     lambda: _ssh_toggle(False),
+            "ssh-set-cred": lambda: _ssh_set_cred(self),
+            # nginx 模块
+            "nginx-start":   lambda: _nginx_toggle(True),
+            "nginx-stop":    lambda: _nginx_toggle(False),
+            "nginx-restart": lambda: _nginx_restart(),
+            # tower-pm2 自身停止（Web UI 开关用）
+            "pm2-stop":      lambda: _pm2_self_stop(),
         }
 
         if act in handlers:
@@ -664,6 +902,149 @@ def _system_uptime() -> str:
         return f"{h}h {m}m"
     except Exception:
         return "—"
+
+# ── SSH 模块（open-server）─────────────────────────────────
+def _read_ssh_port() -> int:
+    try:
+        with open("/etc/ssh/sshd_config", encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("Port "):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 8122
+
+def _write_ssh_port(port: int) -> bool:
+    try:
+        p = Path("/etc/ssh/sshd_config")
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+        found = False
+        out = []
+        for line in lines:
+            if line.strip().startswith("Port ") and not line.strip().startswith("#"):
+                out.append(f"Port {port}\n")
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(f"Port {port}\n")
+        p.write_text("".join(out), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+def _ssh_port_alive(port: int = None, timeout: float = 1.5) -> bool:
+    import socket as _s
+    port = port or _read_ssh_port()
+    try:
+        c = _s.create_connection(("127.0.0.1", port), timeout=timeout)
+        c.close()
+        return True
+    except Exception:
+        return False
+
+def _ssh_status() -> dict:
+    return {
+        "ok": True,
+        "running": _ssh_port_alive(),
+        "port": _read_ssh_port(),
+        "user": "root",
+    }
+
+def _ssh_toggle(start: bool) -> dict:
+    if start:
+        if _ssh_port_alive():
+            return {"ok": True, "message": "sshd already running"}
+        subprocess.Popen(
+            "mkdir -p /run/sshd && setsid nohup /usr/sbin/sshd >/dev/null 2>&1 &",
+            shell=True, start_new_session=True,
+        )
+        time.sleep(1.5)
+        if _ssh_port_alive():
+            return {"ok": True, "message": "sshd started"}
+        return {"ok": False, "error": "sshd failed to start"}
+    else:
+        subprocess.Popen("pkill -x sshd 2>/dev/null; true", shell=True)
+        time.sleep(1)
+        return {"ok": True, "message": "sshd stopped"}
+
+def _ssh_set_cred(handler) -> dict:
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+        body = json.loads(handler.rfile.read(length).decode("utf-8")) if length else {}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    user = body.get("user", "root").strip() or "root"
+    pwd = body.get("password", "").strip()
+    port = body.get("port")
+    msgs = []
+    if pwd:
+        r = subprocess.run(f"echo '{user}:{pwd}' | chpasswd", shell=True, capture_output=True, text=True)
+        msgs.append("password updated" if r.returncode == 0 else f"chpasswd failed: {r.stderr}")
+        if r.returncode != 0:
+            return {"ok": False, "error": msgs[-1]}
+    port_changed = False
+    if port and str(port).isdigit():
+        p = int(port)
+        if p != _read_ssh_port():
+            if not _write_ssh_port(p):
+                return {"ok": False, "error": "failed to write sshd_config"}
+            port_changed = True
+            msgs.append(f"port set to {p}")
+    if port_changed and _ssh_port_alive():
+        # 端口变更需重启 sshd 生效
+        subprocess.Popen("pkill -x sshd; sleep 1; mkdir -p /run/sshd && setsid nohup /usr/sbin/sshd >/dev/null 2>&1 &", shell=True)
+        msgs.append("sshd restarting for new port")
+    return {"ok": True, "message": "; ".join(msgs) or "nothing to update"}
+
+# ── Nginx 模块 ─────────────────────────────────────────────
+def _nginx_running() -> bool:
+    r = subprocess.run("pgrep -x nginx", shell=True, capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+def _nginx_status() -> dict:
+    return {"ok": True, "running": _nginx_running()}
+
+def _nginx_toggle(start: bool) -> dict:
+    if start:
+        if _nginx_running():
+            return {"ok": True, "message": "nginx already running"}
+        subprocess.Popen("setsid nohup nginx >/dev/null 2>&1 &", shell=True, start_new_session=True)
+        time.sleep(1.5)
+        if _nginx_running():
+            return {"ok": True, "message": "nginx started"}
+        return {"ok": False, "error": "nginx failed to start (check config: nginx -t)"}
+    else:
+        subprocess.run("nginx -s stop 2>/dev/null || pkill -x nginx", shell=True, capture_output=True)
+        time.sleep(1)
+        return {"ok": True, "message": "nginx stopped"}
+
+def _nginx_restart() -> dict:
+    subprocess.run("nginx -s stop 2>/dev/null || pkill -x nginx", shell=True, capture_output=True)
+    time.sleep(1)
+    subprocess.Popen("setsid nohup nginx >/dev/null 2>&1 &", shell=True, start_new_session=True)
+    time.sleep(1.5)
+    if _nginx_running():
+        return {"ok": True, "message": "nginx restarted"}
+    return {"ok": False, "error": "nginx restart failed"}
+
+def _pm2_self_stop() -> dict:
+    """Web UI 开关：停所有受管服务（含孤儿）后延迟自杀。
+    自杀放到后台线程 —— 先把 HTTP 响应发回客户端。
+    """
+    def _do():
+        cfg = load_config()
+        for svc in cfg.get("services", []):
+            n = svc.get("name", "")
+            if n:
+                user_stopped.add(n)
+                stop_service(n, force=True)
+        release_lock()
+        time.sleep(1.0)   # 给响应留时间
+        log.info("tower-pm2 self-stop via Web UI switch")
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=_do, daemon=True).start()
+    return {"ok": True, "message": "tower-pm2 stopping"}
 
 # ── 单实例锁 ───────────────────────────────────────────────
 def acquire_lock() -> bool:
@@ -737,7 +1118,8 @@ def main() -> None:
     log.info("tower-pm2 listening on http://0.0.0.0:%d", args.port)
     srv = None
     try:
-        srv = HTTPServer(("0.0.0.0", args.port), Handler)
+        srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+        srv.daemon_threads = True
         srv.serve_forever()
     except KeyboardInterrupt:
         pass

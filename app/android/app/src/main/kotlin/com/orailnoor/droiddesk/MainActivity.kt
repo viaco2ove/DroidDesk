@@ -802,6 +802,14 @@ class MainActivity : FlutterActivity() {
                     }.start()
                 }
 
+                "deleteTowerService" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    Thread {
+                        val ok = linuxRuntime.towerDeleteService(name)
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
                 "startTower" -> {
                     Thread {
                         val ok = linuxRuntime.towerStartDaemon()
@@ -820,6 +828,20 @@ class MainActivity : FlutterActivity() {
                     Thread {
                         val ok = linuxRuntime.towerRestartDaemon()
                         runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "getTowerServices" -> {
+                    Thread {
+                        val services = linuxRuntime.towerListServices()
+                        runOnUiThread { result.success(services) }
+                    }.start()
+                }
+
+                "getTowerSystem" -> {
+                    Thread {
+                        val sys = linuxRuntime.towerGetSystem()
+                        runOnUiThread { result.success(sys) }
                     }.start()
                 }
 
