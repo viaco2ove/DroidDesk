@@ -352,8 +352,46 @@ def watchdog_loop() -> None:
                 restart_times[name] = times
                 start_service(name)
 
+def adopt_orphans() -> None:
+    """认领孤儿进程：PID 文件丢失/损坏时，通过 cmd 特征在 /proc 里找回服务进程。
+    解决多容器/多实例竞争导致的 PID 文件与服务进程失联问题（pid 一致性原则）。
+    """
+    cfg = load_config()
+    for svc in cfg.get("services", []):
+        name = svc.get("name", "")
+        if not name:
+            continue
+        pid = read_pid(name)
+        if pid and pid_exists(pid):
+            continue  # PID 文件正常，跳过
+        # PID 文件缺失或进程已死 → 扫描 /proc 按命令行特征匹配
+        cfg_cmd = svc.get("cmd", "")
+        if not cfg_cmd:
+            continue
+        # 取命令的核心特征（最后一个路径段 + 关键参数）
+        parts = cfg_cmd.replace("NODE_ENV=local ", "").split()
+        key = None
+        for p in parts:
+            if "/" in p and not p.startswith("-"):
+                key = p
+        if not key:
+            continue
+        found = None
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            cmdline = cmdline_of(int(proc_dir.name))
+            if cmdline and key in cmdline and "tower-pm2.py" not in cmdline:
+                found = int(proc_dir.name)
+                break
+        if found:
+            log.info("adopted orphan: %s -> PID %d", name, found)
+            write_pid(name, found)
+
+
 def refresh_all() -> None:
     """刷新所有服务状态"""
+    adopt_orphans()
     cfg = load_config()
     svc_list = cfg.get("services", [])
     for svc in svc_list:
@@ -697,11 +735,18 @@ def main() -> None:
     t.start()
 
     log.info("tower-pm2 listening on http://0.0.0.0:%d", args.port)
+    srv = None
     try:
         srv = HTTPServer(("0.0.0.0", args.port), Handler)
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    except OSError as e:
+        # 端口已被占用：说明已有 tower-pm2 在跑，本实例静默退出（exit 0）
+        # 这是多容器并发启动时的正常竞争，失败方不应报错
+        log.info("port %d in use (%s), another tower-pm2 is running, exiting", args.port, e)
+        release_lock()
+        return
     finally:
         log.info("tower-pm2 stopping all services...")
         shutdown_event.set()
@@ -712,7 +757,8 @@ def main() -> None:
             if name:
                 stop_service(name, force=True)
         release_lock()
-        srv.shutdown()
+        if srv:
+            srv.shutdown()
         log.info("tower-pm2 exited.")
 
 if __name__ == "__main__":

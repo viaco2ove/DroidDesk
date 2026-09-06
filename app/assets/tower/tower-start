@@ -1,27 +1,40 @@
 #!/bin/bash
 # tower-start — 启动 tower-pm2 守护进程
 # 用法: bash tower-start [端口 默认7088]
-set -euo pipefail
+# 注意：不用 pipefail —— curl 在 proot 下即使成功返回数据也可能 exit 28（超时），
+#       pipefail 会让 curl|grep 管道整体失败，导致误判"未运行"而重复启动
+set -eu
 
 PORT="${1:-7088}"
 PDIR="/opt/droiddesk/tower"
 LOG="/var/log/tower/tower-pm2.log"
 PID_FILE="/run/tower/tower-pm2.pid"
 
-# 单实例锁：基于 TCP 端口探测（proot 下最可靠）
-if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+# 单实例锁：curl 探测端口（proot Ubuntu 没 ss/netstat）
+# 用 grep 判断响应内容而非 curl 退出码
+if curl -s -m 3 http://127.0.0.1:$PORT/api/system 2>/dev/null | grep -q '"ok"'; then
     echo "tower-pm2 already listening on port $PORT"
+    # 同步 PID 文件：找到真正在跑 Tower 的 PID
+    for P in /proc/[0-9]*/cmdline; do
+        if grep -q "tower-pm2.py" "$P" 2>/dev/null; then
+            echo "$P" | sed 's|/proc/\([0-9]*\)/cmdline|\1|' > "$PID_FILE" 2>/dev/null
+            break
+        fi
+    done
     exit 0
 fi
-if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
-    echo "tower-pm2 already listening on port $PORT"
-    exit 0
+
+# 旧 Tower PID 文件残留但实际死了 → 清理
+OLD_PID=""
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
+    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        OLD_PID=""
+    fi
 fi
 
 mkdir -p /run/tower /var/log/tower
-
-# 清理残留 PID 文件
-rm -f "$PID_FILE"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting tower-pm2 on port $PORT..." >> "$LOG"
 

@@ -126,11 +126,9 @@ class DroidDeskService : Service() {
             "if [ -f \"\$PM2_PID_FILE\" ] && kill -0 \$(cat \"\$PM2_PID_FILE\") 2>/dev/null; then :; " +
             "else nohup pm2 resurrect >/dev/null 2>&1 </dev/null & fi; "
         } else ""
-        // Tower 启动：若已装 + 开关开 + 7088 端口未监听 → 在该长驻容器内启动 Tower
-        // 这样 Tower 和 sshd 用同一个容器内的进程空间 + 文件系统，对外接口一致
-        val towerSetup = if (wantTower) {
-            "bash -c '[ -f /opt/droiddesk/tower/tower-pm2.py ] && [ ! -e /run/tower/tower-pm2.pid ] && nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & disown 2>/dev/null || true' || true; "
-        } else ""
+        // 不在 session 容器里启动 Tower：避免和 sshd 容器冲突（两个容器同时启动会撞端口）
+        // Tower 由 startUbuntuSshd 在 sshd 容器内启动
+        val towerSetup = ""
         val innerCmd = "${pm2Setup}${towerSetup}exec /bin/bash -i -l"
         val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
         cmdFile.writeText(

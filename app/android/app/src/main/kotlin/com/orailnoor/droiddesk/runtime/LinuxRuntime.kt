@@ -1621,9 +1621,13 @@ class LinuxRuntime(private val context: Context) {
                     "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
                     "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
             val innerCmd = "mkdir -p /run/sshd; " +
-                    // Tower 在同一 proot 实例启动，避免跨实例 unix socket 问题
-                    // 用 bash -c '...' 嵌套简化语法
-                    "bash -c '[ -f /opt/droiddesk/tower/tower-pm2.py ] && [ ! -e /run/tower/tower-pm2.pid ] && nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & disown 2>/dev/null || true' || true; " +
+                    // Tower 启动：检查 PID 文件 + kill -0 检测存活
+                    "if [ -f /opt/droiddesk/tower/tower-pm2.py ]; then " +
+                    "TPID=$(cat /run/tower/tower-pm2.pid 2>/dev/null); " +
+                    "if [ -z \"" + "${'$'}TPID" + "\" ] || ! kill -0 \"" + "${'$'}TPID" + "\" 2>/dev/null; then " +
+                    "nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & " +
+                    "disown 2>/dev/null; " +
+                    "fi; fi; " +
                     "exec /usr/sbin/sshd -D -e"
             val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
             Log.i(TAG, "startUbuntuSshd: $fullCmd")
@@ -2579,11 +2583,17 @@ exec tail -f /dev/null
      * Tower lives at /opt/droiddesk/tower/ inside the ubuntu container.
      */
     fun isTowerInstalled(): Boolean {
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        java.io.File(tmpDirPath).mkdirs()
+        val prootEnv = "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
         val result = executeCommand(
-            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
-            "\"test -f /opt/droiddesk/tower/tower-pm2.py\""
+            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
+            "\"test -f /opt/droiddesk/tower/tower-pm2.py && echo OK\""
         )
-        return result.trim() == ""  // empty = command succeeded = file exists
+        return result.contains("OK")
     }
 
     /**
@@ -2604,11 +2614,18 @@ exec tail -f /dev/null
 
         try {
             // 1. Create directories inside proot Ubuntu
-            // 用 echo + && 串起来，proot 下单个短 mkdir -p 通常能成功
+            // proot-distro 默认临时目录是 /data/data/com.termux/files/usr/tmp/（不存在！）
+            // 必须传 --env PROOT_TMP_DIR 指向我们的 tmpdir，否则 proot 报 "can't create temporary directory"
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val prootEnv = "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
             val dirsCmd = "mkdir -p /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && echo DIRS_OK"
 
             var out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"$dirsCmd\""
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c \"$dirsCmd\""
             )
             Log.i(TAG, "installTower: mkdir output: ${out.take(500)}")
             // mkdir -p 对已存在目录也返回 0，所以即使没 DIRS_OK 也未必失败
@@ -2638,15 +2655,16 @@ exec tail -f /dev/null
                 "uninstall.sh",
             )
             val assetNames = listOf(
-                "assets/tower/tower-pm2.py",
-                "assets/tower/services.json",
-                "assets/tower/tower-start",
-                "assets/tower/tower-stop",
-                "assets/tower/tower-list",
-                "assets/tower/install.sh",
-                "assets/tower/uninstall.sh",
+                "flutter_assets/assets/tower/tower-pm2.py",
+                "flutter_assets/assets/tower/services.json",
+                "flutter_assets/assets/tower/tower-start",
+                "flutter_assets/assets/tower/tower-stop",
+                "flutter_assets/assets/tower/tower-list",
+                "flutter_assets/assets/tower/install.sh",
+                "flutter_assets/assets/tower/uninstall.sh",
             )
 
+            var writeOk = true
             assetNames.forEachIndexed { idx, assetPath ->
                 val progress = 0.1 + (idx.toDouble() / assetNames.size) * 0.7
                 onProgress?.invoke(progress, "Copying ${assetFiles[idx]}...")
@@ -2659,14 +2677,11 @@ exec tail -f /dev/null
                     // proot 内的 sh 会用我们传过去的 stdin
                     val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
 
-                    // 拆成 2 步：先写文件，再 chmod（避免超长单行命令）
-                    // 通过 stdin 传 base64，用 heredoc 接收
-                    val writeCmd = "cat > '$destPath' << 'TOWER_EOF'\n$base64\nTOWER_EOF\nbase64 -d '$destPath' > '$destPath.bin' && mv '$destPath.bin' '$destPath'"
-                    // 上面太长，改用管道：stdin 写 base64
+                    // 用管道：stdin 写 base64
                     val writeCmd2 = "base64 -d > '$destPath' << 'B64EOF'\n$base64\nB64EOF"
 
                     out = executeCommand(
-                        "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"$writeCmd2\""
+                        "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c \"$writeCmd2\""
                     )
                     if (out.contains("Error", ignoreCase = true)) {
                         Log.w(TAG, "installTower: warning writing $destPath: ${out.take(200)}")
@@ -2677,25 +2692,38 @@ exec tail -f /dev/null
                         assetFiles[idx] == "tower-start" || assetFiles[idx] == "tower-stop" ||
                         assetFiles[idx] == "tower-list") {
                         executeCommand(
-                            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"chmod +x '$destPath'\""
+                            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c \"chmod +x '$destPath'\""
                         )
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "installTower: failed to write $assetPath: ${e.message}")
                     onProgress?.invoke(-1.0, "Failed to copy ${assetFiles[idx]}: ${e.message}")
+                    writeOk = false
                     // 不 return，继续复制其他文件
                 }
             }
             onProgress?.invoke(0.85, "Setting permissions...")
 
-            // 3. Verify and chmod
+            // 3. Verify and chmod + 把 services.json 部署到 /etc/tower/（Tower 运行时读这里）
             executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
-                "\"chmod 755 /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && ls -la /opt/droiddesk/tower\""
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
+                "\"chmod 755 /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && " +
+                "cp -f /opt/droiddesk/tower/services.json /etc/tower/services.json && " +
+                "ls -la /opt/droiddesk/tower /etc/tower\""
             )
+
+            // 验证核心文件实际写入成功
+            val verifyCmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c \"test -s /opt/droiddesk/tower/tower-pm2.py && echo OK\""
+            val verifyOut = executeCommand(verifyCmd)
+            if (!verifyOut.contains("OK")) {
+                Log.e(TAG, "installTower: tower-pm2.py missing or empty")
+                onProgress?.invoke(-1.0, "Installation incomplete: tower-pm2.py not written")
+                return false
+            }
 
             onProgress?.invoke(1.0, "Tower installed successfully")
             Log.i(TAG, "installTower: done")
+            return writeOk
             return true
         } catch (e: Exception) {
             Log.e(TAG, "installTower: failed", e)
@@ -2711,9 +2739,15 @@ exec tail -f /dev/null
      */
     fun uninstallTower(): Boolean {
         try {
+            val tmpDirPath = "${tmpDir.absolutePath}/proot"
+            java.io.File(tmpDirPath).mkdirs()
+            val prootEnv = "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                    "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                    "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                    "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
             val cmd = "rm -rf /opt/droiddesk /etc/tower"
             val out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$cmd'"
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c '$cmd'"
             )
             Log.i(TAG, "uninstallTower: $out")
             return true
@@ -2732,19 +2766,45 @@ exec tail -f /dev/null
         if (!installed) {
             return mapOf("installed" to false, "running" to false, "port" to 7088)
         }
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        java.io.File(tmpDirPath).mkdirs()
+        val prootEnv = "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+        // 主要判定：Tower HTTP API 能否响应（最权威）
+        // 注意：curl 在 proot 下即使收到数据也可能 exit 28（超时），所以用 grep 判断响应内容而非 exit code
         try {
             val out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
-                "'cat /run/tower/tower-pm2.pid 2>/dev/null || echo \"\"'"
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
+                "\"curl -s -m 3 http://127.0.0.1:7088/api/system 2>/dev/null | grep -q '\\\"ok\\\"' && echo APID_OK || echo APID_DOWN\""
             )
-            val pid = out.trim().toIntOrNull()
+            val apidUp = out.contains("APID_OK")
+            if (apidUp) {
+                return mapOf(
+                    "installed" to true,
+                    "running" to true,
+                    "port" to 7088,
+                )
+            }
+        } catch (e: Exception) {
+            // ignore, fallback to PID check
+        }
+        // 备用：PID 文件 + kill -0
+        try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
+                "'TPID=$(cat /run/tower/tower-pm2.pid 2>/dev/null); echo \${TPID:-NONE}'"
+            )
+            val pidStr = out.trim()
+            val pid = pidStr.toIntOrNull()
             val running = pid != null && executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
-                "'test -d /proc/$pid'"
-            ).trim().isEmpty()
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
+                "'kill -0 $pid 2>/dev/null && echo ALIVE || echo DEAD'"
+            ).trim().contains("ALIVE")
             return mapOf(
                 "installed" to true,
-                "running" to (running && pid != null),
+                "running" to running,
                 "pid" to (pid ?: 0),
                 "port" to 7088,
             )
@@ -2757,17 +2817,26 @@ exec tail -f /dev/null
      * Start a service via Tower HTTP API.
      * Calls POST /api/services/{name}/start
      */
+    private fun towerProotEnv(): String {
+        val tmpDirPath = "${tmpDir.absolutePath}/proot"
+        java.io.File(tmpDirPath).mkdirs()
+        return "--bind \"${tmpDir.absolutePath}:/tmp\" " +
+                "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
+                "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
+                "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
+    }
+
     fun towerStartService(name: String): Boolean {
         if (!isTowerInstalled()) return false
-        try {
-            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+        return try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/start'"
             val out = executeCommand(cmd)
             Log.i(TAG, "towerStartService($name): $out")
-            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+            out.contains("\"ok\": true")
         } catch (e: Exception) {
             Log.e(TAG, "towerStartService($name) failed: ${e.message}")
-            return false
+            false
         }
     }
 
@@ -2777,15 +2846,15 @@ exec tail -f /dev/null
      */
     fun towerStopService(name: String): Boolean {
         if (!isTowerInstalled()) return false
-        try {
-            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+        return try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/stop'"
             val out = executeCommand(cmd)
             Log.i(TAG, "towerStopService($name): $out")
-            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+            out.contains("\"ok\": true")
         } catch (e: Exception) {
             Log.e(TAG, "towerStopService($name) failed: ${e.message}")
-            return false
+            false
         }
     }
 
@@ -2795,15 +2864,15 @@ exec tail -f /dev/null
      */
     fun towerRestartService(name: String): Boolean {
         if (!isTowerInstalled()) return false
-        try {
-            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+        return try {
+            val cmd = "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "'curl -s -X POST http://127.0.0.1:7088/api/services/$name/restart'"
             val out = executeCommand(cmd)
             Log.i(TAG, "towerRestartService($name): $out")
-            return out.contains("\"ok\": true") || !out.contains("\"ok\": false")
+            out.contains("\"ok\": true")
         } catch (e: Exception) {
             Log.e(TAG, "towerRestartService($name) failed: ${e.message}")
-            return false
+            false
         }
     }
 
@@ -2812,11 +2881,11 @@ exec tail -f /dev/null
     fun towerStartDaemon(): Boolean {
         return try {
             val out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "\"bash /opt/droiddesk/tower/tower-start 7088\""
             )
             Log.i(TAG, "towerStartDaemon: $out")
-            true
+            out.contains("started") || !out.contains("ERROR") && !out.contains("Error:")
         } catch (e: Exception) {
             Log.e(TAG, "towerStartDaemon failed: ${e.message}")
             false
@@ -2826,11 +2895,11 @@ exec tail -f /dev/null
     fun towerStopDaemon(): Boolean {
         return try {
             val out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "\"bash /opt/droiddesk/tower/tower-stop\""
             )
             Log.i(TAG, "towerStopDaemon: $out")
-            true
+            !out.contains("Error")
         } catch (e: Exception) {
             Log.e(TAG, "towerStopDaemon failed: ${e.message}")
             false
@@ -2840,11 +2909,11 @@ exec tail -f /dev/null
     fun towerRestartDaemon(): Boolean {
         return try {
             val out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu ${towerProotEnv()} sh -c " +
                 "\"bash /opt/droiddesk/tower/tower-stop && bash /opt/droiddesk/tower/tower-start 7088\""
             )
             Log.i(TAG, "towerRestartDaemon: $out")
-            true
+            !out.contains("Error")
         } catch (e: Exception) {
             Log.e(TAG, "towerRestartDaemon failed: ${e.message}")
             false
