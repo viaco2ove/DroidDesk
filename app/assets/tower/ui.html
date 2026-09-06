@@ -195,16 +195,18 @@ function renderSvc(svc){
   tb.innerHTML=names.map(function(n){
     const s=svc[n];
     const on=s.status==='online';
+    const dn=esc(n);
+    const act=on?'stop':'start';
     return '<tr>'+
-      '<td><b>'+esc(n)+'</b></td>'+
+      '<td><b>'+dn+'</b></td>'+
       '<td style="color:var(--sub);max-width:260px;overflow:hidden;text-overflow:ellipsis">'+esc(s.cmd||'')+'</td>'+
       '<td>'+(s.start_nginx_with_ubuntu?'yes':'-')+'</td>'+
       '<td>'+(s.keep_live?'yes':'-')+'</td>'+
       '<td><span class="dot '+(on?'on':'off')+'"></span>'+esc(s.status)+'</td>'+
       '<td style="text-align:right">'+
-        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="svcAct(\\''+esc(n)+'\\',\\''+(on?'stop':'start')+'\\')">'+(on?'stop':'start')+'</button>'+
-        '<button class="btn btn-sm" onclick="svcAct(\\''+esc(n)+'\\',\\'restart\\')">restart</button>'+
-        '<button class="btn btn-sm btn-err" onclick="svcDel(\\''+esc(n)+'\\')">delete</button>'+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" data-action="'+act+'" data-name="'+dn+'">'+(on?'stop':'start')+'</button> '+
+        '<button class="btn btn-sm" data-action="restart" data-name="'+dn+'">restart</button> '+
+        '<button class="btn btn-sm btn-err" data-del="'+dn+'">delete</button>'+
       '</td></tr>';
   }).join('');
 }
@@ -215,14 +217,16 @@ function renderPm2(svc){
   tb.innerHTML=names.map(function(n,i){
     const s=svc[n];
     const on=s.status==='online';
+    const dn=esc(n);
+    const act=on?'stop':'start';
     return '<tr>'+
-      '<td>'+i+'</td><td><b>'+esc(n)+'</b></td><td>fork</td><td>'+(s.restart_count||0)+'</td>'+
+      '<td>'+i+'</td><td><b>'+dn+'</b></td><td>fork</td><td>'+(s.restart_count||0)+'</td>'+
       '<td><span class="dot '+(on?'on':'off')+'"></span>'+(on?'online':esc(s.status))+'</td>'+
       '<td>'+(s.cpu||0)+'%</td><td>'+esc(s.mem||'-')+'</td>'+
       '<td style="text-align:right">'+
-        '<button class="btn btn-sm" onclick="pm2Act(\\''+esc(n)+'\\',\\'restart\\')">&#8635;</button>'+
-        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="pm2Act(\\''+esc(n)+'\\',\\''+(on?'stop':'start')+'\\')">'+(on?'&#9632;':'&#9654;')+'</button>'+
-        '<button class="btn btn-sm btn-err" onclick="pm2Del(\\''+esc(n)+'\\')">&#10005;</button>'+
+        '<button class="btn btn-sm" data-pm2-action="restart" data-pm2-name="'+dn+'">&#8635;</button> '+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" data-pm2-action="'+act+'" data-pm2-name="'+dn+'">'+(on?'&#9632;':'&#9654;')+'</button> '+
+        '<button class="btn btn-sm btn-err" data-pm2-del="'+dn+'">&#10005;</button>'+
       '</td></tr>';
   }).join('');
 }
@@ -296,6 +300,26 @@ async function doAdd(){
   if(r.ok){hideAdd();toast('已添加 '+name);setTimeout(refresh,600)}
   else toast(r.error,false);
 }
+// 事件委托：Service 表按钮
+document.getElementById('svc-body').addEventListener('click', function(e){
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  if(btn.dataset.action){
+    svcAct(btn.dataset.name, btn.dataset.action);
+  } else if(btn.dataset.del){
+    svcDel(btn.dataset.del);
+  }
+});
+// 事件委托：PM2 表按钮
+document.getElementById('pm2-body').addEventListener('click', function(e){
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  if(btn.dataset.pm2Action){
+    pm2Act(btn.dataset.pm2Name, btn.dataset.pm2Action);
+  } else if(btn.dataset.pm2Del){
+    pm2Del(btn.dataset.pm2Del);
+  }
+});
 refresh();
 setInterval(refresh,5000);
 </script>
