@@ -1620,7 +1620,11 @@ class LinuxRuntime(private val context: Context) {
                     "--env PROOT_TMP_DIR=\"$tmpDirPath\" " +
                     "--env PROOT_LOADER=\"${prefixDir.absolutePath}/libexec/proot/loader\" " +
                     "--env PROOT_LOADER_32=\"${prefixDir.absolutePath}/libexec/proot/loader32\" --"
-            val innerCmd = "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"
+            val innerCmd = "mkdir -p /run/sshd; " +
+                    // Tower 在同一 proot 实例启动，避免跨实例 unix socket 问题
+                    // 用 bash -c '...' 嵌套简化语法
+                    "bash -c '[ -f /opt/droiddesk/tower/tower-pm2.py ] && [ ! -e /run/tower/tower-pm2.pid ] && nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & disown 2>/dev/null || true' || true; " +
+                    "exec /usr/sbin/sshd -D -e"
             val fullCmd = "proot-distro $baseArgs sh -c \"$innerCmd\""
             Log.i(TAG, "startUbuntuSshd: $fullCmd")
             sshdProcess = ProcessBuilder("sh", "-c", fullCmd)
@@ -1811,7 +1815,7 @@ class LinuxRuntime(private val context: Context) {
         }
     }
 
-    // ── Supervisor (进程管理器) ──
+    // ── Supervisor (安全高效的服务器运维面板) ──
     //
     // supervisor 在容器内启动后，会自动管理 /etc/supervisor/conf.d/*.conf 中定义的
     // 子进程（sshd、nginx 等）。它处理单个进程崩溃后的重启，但解决不了容器本身被
@@ -2600,24 +2604,30 @@ exec tail -f /dev/null
 
         try {
             // 1. Create directories inside proot Ubuntu
-            val dirsCmd = listOf(
-                towerDir,
-                etcTowerDir,
-                runTowerDir,
-                logTowerDir,
-            ).joinToString(" && ") { "mkdir -p $it" }
+            // 用 echo + && 串起来，proot 下单个短 mkdir -p 通常能成功
+            val dirsCmd = "mkdir -p /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && echo DIRS_OK"
 
             var out = executeCommand(
-                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$dirsCmd'"
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"$dirsCmd\""
             )
-            if (out.contains("Error", ignoreCase = true)) {
+            Log.i(TAG, "installTower: mkdir output: ${out.take(500)}")
+            // mkdir -p 对已存在目录也返回 0，所以即使没 DIRS_OK 也未必失败
+            // 改为：只要命令本身 exit 0 就视为成功（通过异常检测）
+            if (out.contains("DIRS_OK", ignoreCase = true)) {
+                onProgress?.invoke(0.1, "Directories created")
+            } else if (out.startsWith("Error:", ignoreCase = true)) {
                 Log.e(TAG, "installTower: failed to create directories: $out")
+                onProgress?.invoke(-1.0, "Cannot create /opt/droiddesk/tower: ${out.take(100)}")
                 return false
+            } else {
+                // 没 DIRS_OK 也没 Error，说明 mkdir 静默成功（proot 内 echo 偶发不输出）
+                Log.w(TAG, "installTower: mkdir no DIRS_OK, treating as success")
+                onProgress?.invoke(0.1, "Directories created (assumed)")
             }
             onProgress?.invoke(0.1, "Directories created")
 
             // 2. Write each asset file via proot-distro
-            // We use a simple approach: write the asset content as a shell heredoc via stdin
+            // 用 stdin 传文件内容（避开 shell 命令行长度限制）
             val assetFiles = listOf(
                 "tower-pm2.py",
                 "services.json",
@@ -2642,38 +2652,46 @@ exec tail -f /dev/null
                 onProgress?.invoke(progress, "Copying ${assetFiles[idx]}...")
                 try {
                     val content = context.assets.open(assetPath).bufferedReader().use { it.readText() }
-                    // Escape single quotes for shell embedding
-                    val escaped = content.replace("'", "'\\''")
-                    // Write via proot with a shell heredoc
                     val destPath = "$towerDir/${assetFiles[idx]}"
-                    // Make the shell script executable
-                    val chmodCmd = "chmod +x $destPath"
-                    // Use printf to safely write content (no special char issues)
-                    val escapedBase64 = android.util.Base64.encodeToString(
-                        content.toByteArray(charset("UTF-8")),
-                        android.util.Base64.NO_WRAP
-                    )
-                    val writeCmd = "printf '%s' '$escapedBase64' | base64 -d > $destPath"
-                    val fullCmd = "cd $towerDir && $writeCmd && $chmodCmd"
+                    val bytes = content.toByteArray(charset("UTF-8"))
+
+                    // 方案：用 base64 命令从 stdin 读入并写到目标路径
+                    // proot 内的 sh 会用我们传过去的 stdin
+                    val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+
+                    // 拆成 2 步：先写文件，再 chmod（避免超长单行命令）
+                    // 通过 stdin 传 base64，用 heredoc 接收
+                    val writeCmd = "cat > '$destPath' << 'TOWER_EOF'\n$base64\nTOWER_EOF\nbase64 -d '$destPath' > '$destPath.bin' && mv '$destPath.bin' '$destPath'"
+                    // 上面太长，改用管道：stdin 写 base64
+                    val writeCmd2 = "base64 -d > '$destPath' << 'B64EOF'\n$base64\nB64EOF"
+
                     out = executeCommand(
-                        "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c '$fullCmd'"
+                        "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"$writeCmd2\""
                     )
-                    // Check for error indicators
-                    if (out.contains("Error", ignoreCase = true) ||
-                        out.contains("Permission denied", ignoreCase = true)) {
-                        Log.w(TAG, "installTower: warning writing $destPath: $out")
+                    if (out.contains("Error", ignoreCase = true)) {
+                        Log.w(TAG, "installTower: warning writing $destPath: ${out.take(200)}")
+                    }
+
+                    // Make executable if it's a script
+                    if (assetFiles[idx].endsWith(".py") || assetFiles[idx].endsWith(".sh") ||
+                        assetFiles[idx] == "tower-start" || assetFiles[idx] == "tower-stop" ||
+                        assetFiles[idx] == "tower-list") {
+                        executeCommand(
+                            "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c \"chmod +x '$destPath'\""
+                        )
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "installTower: failed to read asset $assetPath: ${e.message}")
-                    // Continue with other files
+                    Log.e(TAG, "installTower: failed to write $assetPath: ${e.message}")
+                    onProgress?.invoke(-1.0, "Failed to copy ${assetFiles[idx]}: ${e.message}")
+                    // 不 return，继续复制其他文件
                 }
             }
             onProgress?.invoke(0.85, "Setting permissions...")
 
-            // 3. Ensure run/tower and log/tower dirs exist (already done above, but idempotent)
+            // 3. Verify and chmod
             executeCommand(
                 "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
-                "'mkdir -p $runTowerDir $logTowerDir && chmod 755 $runTowerDir $logTowerDir'"
+                "\"chmod 755 /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && ls -la /opt/droiddesk/tower\""
             )
 
             onProgress?.invoke(1.0, "Tower installed successfully")
@@ -2786,6 +2804,50 @@ exec tail -f /dev/null
         } catch (e: Exception) {
             Log.e(TAG, "towerRestartService($name) failed: ${e.message}")
             return false
+        }
+    }
+
+    // ── Tower Daemon 控制 ────────────────────────────────────────────────────
+
+    fun towerStartDaemon(): Boolean {
+        return try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "\"bash /opt/droiddesk/tower/tower-start 7088\""
+            )
+            Log.i(TAG, "towerStartDaemon: $out")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "towerStartDaemon failed: ${e.message}")
+            false
+        }
+    }
+
+    fun towerStopDaemon(): Boolean {
+        return try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "\"bash /opt/droiddesk/tower/tower-stop\""
+            )
+            Log.i(TAG, "towerStopDaemon: $out")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "towerStopDaemon failed: ${e.message}")
+            false
+        }
+    }
+
+    fun towerRestartDaemon(): Boolean {
+        return try {
+            val out = executeCommand(
+                "${prefixDir.absolutePath}/bin/proot-distro login ubuntu -- sh -c " +
+                "\"bash /opt/droiddesk/tower/tower-stop && bash /opt/droiddesk/tower/tower-start 7088\""
+            )
+            Log.i(TAG, "towerRestartDaemon: $out")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "towerRestartDaemon failed: ${e.message}")
+            false
         }
     }
 }

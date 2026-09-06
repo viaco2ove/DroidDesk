@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+# tower-list — 列出所有服务状态
+import json, os, sys
+from pathlib import Path
+
+CONFIG = "/etc/tower/services.json"
+PIDDIR = "/run/tower"
+
+def pid_exists(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ProcessLookupError, ValueError):
+        return False
+
+def read_pid(name):
+    try:
+        return Path(PIDDIR, f"{name}.pid").read_text().strip()
+    except Exception:
+        return ""
+
+try:
+    cfg = json.load(open(CONFIG, encoding="utf-8"))
+except Exception:
+    print("Cannot read", CONFIG)
+    sys.exit(1)
+
+svcs = cfg.get("services", [])
+if not svcs:
+    print("No services registered.")
+    sys.exit(0)
+
+# 表头
+print(f"{'Name':<22} {'PID':>8} {'Status':<12} {'KeepLive':<10} {'Nginx':<7}")
+print("-" * 65)
+
+for svc in svcs:
+    name  = svc.get("name", "")
+    pid   = read_pid(name)
+    alive = pid_exists(pid) if pid else False
+    status = "🟢 online" if alive else "🔴 stopped"
+    kl    = "✅" if svc.get("keep_live", False) else "❌"
+    ng    = "✅" if svc.get("start_nginx_with_ubuntu", False) else "❌"
+    print(f"{name:<22} {pid or '—':>8} {status:<12} {kl:<10} {ng:<7}")

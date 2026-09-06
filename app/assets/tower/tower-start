@@ -1,0 +1,41 @@
+#!/bin/bash
+# tower-start — 启动 tower-pm2 守护进程
+# 用法: bash tower-start [端口 默认7088]
+set -euo pipefail
+
+PORT="${1:-7088}"
+PDIR="/opt/droiddesk/tower"
+LOG="/var/log/tower/tower-pm2.log"
+PID_FILE="/run/tower/tower-pm2.pid"
+
+# 单实例锁：基于 TCP 端口探测（proot 下最可靠）
+if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    echo "tower-pm2 already listening on port $PORT"
+    exit 0
+fi
+if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
+    echo "tower-pm2 already listening on port $PORT"
+    exit 0
+fi
+
+mkdir -p /run/tower /var/log/tower
+
+# 清理残留 PID 文件
+rm -f "$PID_FILE"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting tower-pm2 on port $PORT..." >> "$LOG"
+
+# setsid 启动，并等待主进程写 PID 文件
+setsid nohup python3 "$PDIR/tower-pm2.py" --port "$PORT" >> "$LOG" 2>&1 &
+STARTED_PID=$!
+echo "$STARTED_PID" > "$PID_FILE"
+disown 2>/dev/null || true
+
+sleep 2
+if kill -0 "$STARTED_PID" 2>/dev/null; then
+    echo "tower-pm2 started (PID $STARTED_PID, port $PORT)"
+else
+    echo "ERROR: tower-pm2 failed to start. Check $LOG"
+    rm -f "$PID_FILE"
+    exit 1
+fi

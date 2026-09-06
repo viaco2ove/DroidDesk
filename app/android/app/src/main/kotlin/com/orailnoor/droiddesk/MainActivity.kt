@@ -802,6 +802,32 @@ class MainActivity : FlutterActivity() {
                     }.start()
                 }
 
+                "startTower" -> {
+                    Thread {
+                        val ok = linuxRuntime.towerStartDaemon()
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "stopTower" -> {
+                    Thread {
+                        val ok = linuxRuntime.towerStopDaemon()
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "restartTower" -> {
+                    Thread {
+                        val ok = linuxRuntime.towerRestartDaemon()
+                        runOnUiThread { result.success(ok) }
+                    }.start()
+                }
+
+                "openUrl" -> {
+                    val url = call.argument<String>("url") ?: ""
+                    result.success(openExternalUrl(url))
+                }
+
                 "setupBootstrap" -> {
                     if (chrootRuntime.hasRoot()) {
                         // Nothing to bootstrap for chroot; rootfs handles it
@@ -969,5 +995,19 @@ class MainActivity : FlutterActivity() {
     private fun getAvailableStorage(): Long {
         val stat = android.os.StatFs(filesDir.absolutePath)
         return stat.availableBytes / (1024 * 1024)
+    }
+
+    private fun openExternalUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        return try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "openExternalUrl failed: ${e.message}")
+            false
+        }
     }
 }

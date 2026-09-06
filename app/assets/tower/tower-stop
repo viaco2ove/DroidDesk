@@ -1,0 +1,53 @@
+#!/bin/bash
+# tower-stop — 停止 tower-pm2 及所有托管服务
+# 用法: bash tower-stop [--force]
+set -euo pipefail
+
+FORCE=""
+if [ "${1:-}" = "--force" ]; then FORCE=1; fi
+
+PDIR="/opt/droiddesk/tower"
+PID_FILE="/run/tower/tower-pm2.pid"
+
+if [ ! -f "$PID_FILE" ]; then
+    echo "tower-pm2 not running (no PID file)."
+    exit 0
+fi
+
+PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
+if [ -z "$PID" ]; then
+    echo "tower-pm2 not running."
+    rm -f "$PID_FILE"
+    exit 0
+fi
+
+if ! kill -0 "$PID" 2>/dev/null; then
+    echo "tower-pm2 not running (stale PID)."
+    rm -f "$PID_FILE"
+    exit 0
+fi
+
+echo "Stopping tower-pm2 (PID $PID)..."
+kill -TERM "$PID" 2>/dev/null || true
+
+# 优雅等待（最多 10s）
+for i in $(seq 1 20); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+        echo "tower-pm2 stopped gracefully."
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+    sleep 0.5
+done
+
+# 强制杀
+if [ -n "$FORCE" ]; then
+    echo "Force killing tower-pm2..."
+    kill -KILL "$PID" 2>/dev/null || true
+    sleep 0.5
+    rm -f "$PID_FILE"
+    echo "tower-pm2 killed."
+else
+    echo "tower-pm2 still alive after 10s. Use --force to kill."
+    exit 1
+fi

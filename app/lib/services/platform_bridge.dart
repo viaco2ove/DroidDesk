@@ -328,4 +328,30 @@ class DroidDeskPlatform {
     final r = await _channel.invokeMethod<bool>('restartTowerService', {'name': name});
     return r ?? false;
   }
+
+  /// Open an external URL in the system browser / handler.
+  static Future<bool> openUrl(String url) async {
+    final r = await _channel.invokeMethod<bool>('openUrl', {'url': url});
+    return r ?? false;
+  }
+
+  // ── Tower Daemon 控制 ──────────────────────────────────────────────────────
+
+  /// Start tower-pm2 daemon.
+  static Future<bool> startTower() async {
+    final r = await _channel.invokeMethod<bool>('startTower');
+    return r ?? false;
+  }
+
+  /// Stop tower-pm2 daemon.
+  static Future<bool> stopTower() async {
+    final r = await _channel.invokeMethod<bool>('stopTower');
+    return r ?? false;
+  }
+
+  /// Restart tower-pm2 daemon (stop + start).
+  static Future<bool> restartTower() async {
+    final r = await _channel.invokeMethod<bool>('restartTower');
+    return r ?? false;
+  }
 }

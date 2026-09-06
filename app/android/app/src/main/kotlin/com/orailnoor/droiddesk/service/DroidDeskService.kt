@@ -118,13 +118,20 @@ class DroidDeskService : Service() {
         // 启动 shell 时绝不 pkill / pm2 kill 现存 daemon，仅当 daemon 缺失时才补拉一次
         val wantPm2 = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
             .getBoolean("pm2WithUbuntu", false)
+        val wantTower = getSharedPreferences("ubuntu_console", MODE_PRIVATE)
+            .getBoolean("towerWithUbuntu", false)
         // session 容器内部命令：daemon 存活（supervisor 托管或已有）→ 不动；全缺失 → 补 resurrect
         val pm2Setup = if (wantPm2) {
             "PM2_PID_FILE=/root/.pm2/pm2.pid; " +
             "if [ -f \"\$PM2_PID_FILE\" ] && kill -0 \$(cat \"\$PM2_PID_FILE\") 2>/dev/null; then :; " +
             "else nohup pm2 resurrect >/dev/null 2>&1 </dev/null & fi; "
         } else ""
-        val innerCmd = "${pm2Setup}exec /bin/bash -i -l"
+        // Tower 启动：若已装 + 开关开 + 7088 端口未监听 → 在该长驻容器内启动 Tower
+        // 这样 Tower 和 sshd 用同一个容器内的进程空间 + 文件系统，对外接口一致
+        val towerSetup = if (wantTower) {
+            "bash -c '[ -f /opt/droiddesk/tower/tower-pm2.py ] && [ ! -e /run/tower/tower-pm2.pid ] && nohup setsid python3 /opt/droiddesk/tower/tower-pm2.py --port 7088 >/var/log/tower/tower-pm2.log 2>&1 </dev/null & disown 2>/dev/null || true' || true; "
+        } else ""
+        val innerCmd = "${pm2Setup}${towerSetup}exec /bin/bash -i -l"
         val cmdFile = java.io.File(filesDir, "bin/ubuntu-shell.cmd")
         cmdFile.writeText(
             "export PREFIX=\"$prefixPath\"; " +
@@ -144,7 +151,7 @@ class DroidDeskService : Service() {
             "--env PROOT_LOADER_32=\"$prefixPath/libexec/proot/loader32\" " +
             "-- sh -c '$innerCmd'"
         )
-        Log.i(TAG, "Daemon: Ubuntu session command file written (pm2=$wantPm2)")
+        Log.i(TAG, "Daemon: Ubuntu session command file written (pm2=$wantPm2, tower=$wantTower)")
 
         // 启动会话进程（不等待输出）
         val process = ProcessBuilder(
@@ -170,7 +177,7 @@ class DroidDeskService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // pm2 / supervisor 健康监控已迁移至 DroidDesk Tower（统一进程管理器）
+    // pm2 / supervisor 健康监控已迁移至 DroidDesk Tower（安全高效的服务器运维面板）
     override fun onDestroy() {
         KeepAliveFloat.dismiss()
         releaseWakeLock()

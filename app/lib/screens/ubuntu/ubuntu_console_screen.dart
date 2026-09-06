@@ -30,9 +30,18 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
   Timer? _statusTimer;
   bool _statusBusy = false;
 
+  // Tower 状态
+  bool _towerInstalled = false;
+  bool _towerRunning = false;
+  int _towerPort = 7088;
+  bool _installingTower = false;
+  double _towerInstallProgress = 0.0;
+  String _towerInstallStatus = '';
+
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   final _portCtrl = TextEditingController();
+  final _towerPortCtrl = TextEditingController();
 
   @override
   void initState() {
@@ -49,6 +58,7 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     _userCtrl.dispose();
     _passCtrl.dispose();
     _portCtrl.dispose();
+    _towerPortCtrl.dispose();
     super.dispose();
   }
 
@@ -84,6 +94,16 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
         _sshdRunning = s['sshdRunning'] as bool;
         _sshPort = s['sshPort'] as int;
       });
+
+      // Tower 状态
+      try {
+        final ts = await DroidDeskPlatform.getTowerStatus();
+        if (!mounted) return;
+        setState(() {
+          _towerInstalled = ts['installed'] as bool? ?? _towerInstalled;
+          _towerRunning = ts['running'] as bool? ?? _towerRunning;
+        });
+      } catch (_) {}
     } finally {
       _statusBusy = false;
     }
@@ -126,6 +146,20 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
         _passCtrl.text = creds['password'] ?? '';
         _portCtrl.text = creds['port'] ?? '22';
       });
+
+      // Tower 状态独立加载（不阻塞主流程）
+      try {
+        final ts = await DroidDeskPlatform.getTowerStatus();
+        if (!mounted) return;
+        setState(() {
+          _towerInstalled = ts['installed'] as bool? ?? false;
+          _towerRunning = ts['running'] as bool? ?? false;
+          _towerPort = ts['port'] as int? ?? 7088;
+          _towerPortCtrl.text = _towerPort.toString();
+        });
+      } catch (e) {
+        // ignore
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -180,6 +214,105 @@ class _UbuntuConsoleScreenState extends State<UbuntuConsoleScreen> with WidgetsB
     messenger.showSnackBar(
       SnackBar(content: Text('Credentials saved (port $port)')),
     );
+  }
+
+  // ---------------- Tower ----------------
+
+  Future<void> _installTower() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() {
+      _installingTower = true;
+      _towerInstallProgress = 0.0;
+      _towerInstallStatus = '准备安装...';
+    });
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Installing Tower (background)')),
+    );
+    final ok = await DroidDeskPlatform.installTower(
+      onProgress: (p, status) {
+        if (mounted) {
+          setState(() {
+            _towerInstallProgress = p;
+            _towerInstallStatus = status;
+          });
+        }
+      },
+    );
+    final installed = await DroidDeskPlatform.isTowerInstalled();
+    if (!mounted) return;
+    setState(() {
+      _installingTower = false;
+      _towerInstalled = installed;
+      _towerInstallProgress = 0.0;
+      _towerInstallStatus = '';
+    });
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Tower installed' : 'Tower installation failed'),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
+  }
+
+  Future<void> _uninstallTower() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await DroidDeskPlatform.uninstallTower();
+    final installed = await DroidDeskPlatform.isTowerInstalled();
+    if (!mounted) return;
+    setState(() {
+      _towerInstalled = installed;
+      _towerRunning = false;
+    });
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Tower removed' : 'Tower removal failed'),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+  }
+
+  Future<void> _toggleTower(bool wantRunning) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = wantRunning
+        ? await DroidDeskPlatform.startTower()
+        : await DroidDeskPlatform.stopTower();
+    if (!mounted) return;
+    setState(() {
+      _towerRunning = ok && wantRunning;
+    });
+    // 持久化到 SharedPreferences，让 Service 在 app 重启时自动恢复
+    await DroidDeskPlatform.setUbuntuSetting('towerWithUbuntu', wantRunning && ok);
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok
+            ? (wantRunning ? 'Tower started' : 'Tower stopped')
+            : (wantRunning ? 'Tower start failed' : 'Tower stop failed')),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
+  }
+
+  Future<void> _restartTower() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await DroidDeskPlatform.restartTower();
+    if (!mounted) return;
+    setState(() {
+      _towerRunning = ok;
+    });
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Tower restarted' : 'Tower restart failed'),
+        backgroundColor: ok ? DroidTheme.success : DroidTheme.error,
+      ),
+    );
+    await _refreshStatus();
+  }
+
+  Future<void> _openTowerWeb() async {
+    final port = int.tryParse(_towerPortCtrl.text.trim()) ?? _towerPort;
+    await DroidDeskPlatform.openUrl('http://127.0.0.1:$port');
   }
 
   @override
@@ -393,6 +526,126 @@ const SizedBox(height: 16),
                               'sshd will run as long as Ubuntu is running'),
                           activeColor: const Color(0xFFE95420),
                         ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+
+                  // DroidDesk Tower
+                  Text('DROIDDESK TOWER', style: DroidTheme.label),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: DroidTheme.cardBg,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: _towerInstalled
+                            ? DroidTheme.success.withValues(alpha: 0.4)
+                            : DroidTheme.surfaceBorder,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.dns_rounded,
+                              color: _towerInstalled
+                                  ? (_towerRunning
+                                      ? DroidTheme.success
+                                      : DroidTheme.warning)
+                                  : DroidTheme.textSecondary,
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _towerInstalled
+                                        ? (_towerRunning
+                                            ? 'Tower running'
+                                            : 'Tower installed (stopped)')
+                                        : 'Tower not installed',
+                                    style: DroidTheme.bodyMd,
+                                  ),
+                                  Text(
+                                    'Web UI: http://<device-ip>:$_towerPort',
+                                    style: DroidTheme.bodySm,
+                                  ),
+                                ],
+                              ),
+                            ),
+                            if (_towerInstalled)
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline_rounded,
+                                    color: DroidTheme.error),
+                                tooltip: 'Uninstall',
+                                onPressed: _uninstallTower,
+                              )
+                            else
+                              FilledButton(
+                                onPressed: _installingTower ? null : _installTower,
+                                child: Text(_installingTower ? '...' : 'Install'),
+                              ),
+                          ],
+                        ),
+                        if (_installingTower) ...[
+                          const SizedBox(height: 8),
+                          LinearProgressIndicator(value: _towerInstallProgress > 0 ? _towerInstallProgress : null),
+                          const SizedBox(height: 4),
+                          Text(_towerInstallStatus, style: DroidTheme.bodySm),
+                        ],
+                        const Divider(
+                            height: 20, color: DroidTheme.surfaceBorder),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _towerPortCtrl,
+                                keyboardType: TextInputType.number,
+                                decoration: const InputDecoration(
+                                  labelText: 'Web UI port',
+                                  border: OutlineInputBorder(),
+                                ),
+                                onSubmitted: (_) => _openTowerWeb(),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            FilledButton.icon(
+                              onPressed:
+                                  _towerRunning ? _openTowerWeb : null,
+                              icon: const Icon(Icons.open_in_browser_rounded,
+                                  size: 18),
+                              label: const Text('Open'),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _towerRunning,
+                          onChanged:
+                              _towerInstalled ? _toggleTower : null,
+                          title: const Text('Start Tower'),
+                          subtitle: const Text(
+                              'Web service manager (pm2-style, single daemon)'),
+                          activeColor: const Color(0xFFE95420),
+                        ),
+                        if (_towerInstalled) ...[
+                          const SizedBox(height: 4),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton.icon(
+                              onPressed: _towerRunning ? _restartTower : null,
+                              icon: const Icon(Icons.refresh_rounded, size: 18),
+                              label: const Text('Restart Tower'),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
