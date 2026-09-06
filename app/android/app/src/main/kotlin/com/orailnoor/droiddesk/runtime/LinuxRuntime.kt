@@ -2647,7 +2647,9 @@ exec tail -f /dev/null
             // 用 stdin 传文件内容（避开 shell 命令行长度限制）
             val assetFiles = listOf(
                 "tower-pm2.py",
+                "ui.html",
                 "services.json",
+                "pm2.json",
                 "tower-start",
                 "tower-stop",
                 "tower-list",
@@ -2658,7 +2660,9 @@ exec tail -f /dev/null
             )
             val assetNames = listOf(
                 "flutter_assets/assets/tower/tower-pm2.py",
+                "flutter_assets/assets/tower/ui.html",
                 "flutter_assets/assets/tower/services.json",
+                "flutter_assets/assets/tower/pm2.json",
                 "flutter_assets/assets/tower/tower-start",
                 "flutter_assets/assets/tower/tower-stop",
                 "flutter_assets/assets/tower/tower-list",
@@ -2713,7 +2717,8 @@ exec tail -f /dev/null
             executeCommand(
                 "${prefixDir.absolutePath}/bin/proot-distro login ubuntu $prootEnv sh -c " +
                 "\"chmod 755 /opt/droiddesk/tower /etc/tower /run/tower /var/log/tower && " +
-                "cp -f /opt/droiddesk/tower/services.json /etc/tower/services.json && " +
+                "[ -f /etc/tower/services.json ] || cp /opt/droiddesk/tower/services.json /etc/tower/services.json; " +
+                "[ -f /etc/tower/pm2.json ] || cp /opt/droiddesk/tower/pm2.json /etc/tower/pm2.json; " +
                 "mkdir -p /usr/local/bin && " +
                 "ln -sf /opt/droiddesk/tower/droiddesk-tower /usr/local/bin/droiddesk-tower && " +
                 "ln -sf /opt/droiddesk/tower/tower-pm2 /usr/local/bin/tower-pm2 && " +
@@ -2744,7 +2749,7 @@ exec tail -f /dev/null
     /**
      * Uninstall Tower from proot Ubuntu.
      * Removes /opt/droiddesk/tower/ and /etc/tower/ but does NOT touch
-     * the user's business processes (toonflow-game, etc.).
+     * the user's business processes (xxx-game, etc.).
      */
     fun uninstallTower(): Boolean {
         try {

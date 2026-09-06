@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-tower-pm2 CLI — pm2 风格命令行客户端
-─────────────────────────────────────
-所有命令通过 HTTP API (127.0.0.1:7088) 与 tower-pm2 daemon 通信。
-TCP 通信保证 pid 一致性：无论从哪个 proot 实例/session 执行，
-看到的都是同一份服务状态。
+tower-pm2 CLI — pm2 风格命令行客户端（操作 Tower PM2 模块注册表）
+──────────────────────────────────────────────────────────────────
+所有命令通过 HTTP API (127.0.0.1:7088) 与 Tower 面板通信。
+TCP 通信保证 pid 一致性：无论从哪个 proot 实例执行，结果一致。
+
+注意：tower-pm2 只操作 Tower PM2 模块的注册表（/etc/tower/pm2.json），
+     与 Service 模块（/etc/tower/services.json）无关。
 
 命令（与 pm2 对齐）:
-  tower-pm2 list | status | ls          列出所有服务（pm2 风格表格）
+  tower-pm2 list | status | ls          列出 Tower PM2 托管的服务
   tower-pm2 jlist                       JSON 格式输出
   tower-pm2 start <name>                启动服务
   tower-pm2 stop <name>                 停止服务
@@ -16,7 +18,8 @@ TCP 通信保证 pid 一致性：无论从哪个 proot 实例/session 执行，
   tower-pm2 add <name> <cmd> [选项]      添加服务
   tower-pm2 logs <name> [lines]         查看服务日志
   tower-pm2 monit                       实时监控（2s 刷新，Ctrl+C 退出）
-  tower-pm2 ping                        检查 daemon 是否存活
+  tower-pm2 on | off                    启用/停用 Tower PM2 模块
+  tower-pm2 ping                        检查面板是否存活
 """
 
 import sys
@@ -39,7 +42,7 @@ def api_get(path: str, timeout: int = 5) -> dict:
         return {"ok": False, "error": f"tower-pm2 daemon unreachable: {e}"}
 
 
-def api_post(path: str, data: dict = None, timeout: int = 15) -> dict:
+def api_post(path: str, data: dict = None, timeout: int = 30) -> dict:
     try:
         req = urllib.request.Request(
             API + path, method="POST",
@@ -53,7 +56,6 @@ def api_post(path: str, data: dict = None, timeout: int = 15) -> dict:
 
 
 def disp_width(s: str) -> int:
-    """显示宽度：CJK 字符算 2"""
     return sum(2 if ord(c) > 0x2E7F else 1 for c in s)
 
 
@@ -62,21 +64,20 @@ def pad(s: str, width: int) -> str:
 
 
 def print_table(services: dict) -> None:
-    """pm2 风格表格"""
     rows = []
     for idx, (name, st) in enumerate(sorted(services.items())):
         status = st.get("status", "stopped")
-        icon = "●" if status == "online" else ("◐" if status == "degraded" else "○")
+        icon = "●" if status == "online" else ("◐" if status == "crash_loop" else "○")
         rows.append({
             "id": str(idx),
             "name": name,
             "mode": "fork",
             "rc": str(st.get("restart_count", 0)),
             "status": f"{icon} {status}",
-            "pid": str(st.get("pid") or "—"),
+            "pid": str(st.get("pid") or "-"),
             "cpu": f"{st.get('cpu', 0)}%",
-            "mem": str(st.get("mem", "—")),
-            "uptime": str(st.get("uptime", "—")),
+            "mem": str(st.get("mem", "-")),
+            "uptime": str(st.get("uptime", "-")),
         })
 
     headers = {"id": "id", "name": "name", "mode": "mode", "rc": "↺",
@@ -89,6 +90,10 @@ def print_table(services: dict) -> None:
         for r in rows:
             w = max(w, disp_width(r[c]))
         widths[c] = w
+
+    if not rows:
+        print("no services in Tower PM2 registry. use: tower-pm2 add <name> <cmd>")
+        return
 
     sep = "├" + "┼".join("─" * (widths[c] + 2) for c in cols) + "┤"
     top = "┌" + "┬".join("─" * (widths[c] + 2) for c in cols) + "┐"
@@ -104,21 +109,16 @@ def print_table(services: dict) -> None:
 
 
 def cmd_list(args):
-    r = api_get("/api/list")
+    r = api_get("/api/pm2/status")
     if not r.get("ok"):
         print(f"error: {r.get('error')}", file=sys.stderr)
         return 5
     svc = r.get("services", {})
-    if not svc:
-        print("no services registered. use: tower-pm2 add <name> <cmd>")
-        return 0
-    if getattr(cmd_list, "_json", False):
-        out = []
-        for idx, (name, st) in enumerate(sorted(svc.items())):
-            out.append({"id": idx, "name": name, "mode": "fork", **st})
+    if "--json" in args:
+        out = [{"id": i, "name": n, "mode": "fork", **st} for i, (n, st) in enumerate(sorted(svc.items()))]
         print(json.dumps(out, ensure_ascii=False, indent=2))
-    else:
-        print_table(svc)
+        return 0
+    print_table(svc)
     return 0
 
 
@@ -131,28 +131,28 @@ def _require_name(args):
 
 def cmd_start(args):
     name = _require_name(args)
-    r = api_post(f"/api/start/{name}")
+    r = api_post(f"/api/pm2/start/{name}")
     print(r.get("error") or f"[{name}] started (PID {r.get('pid')})" if r.get("ok") else r.get("error"))
     return 0 if r.get("ok") else 1
 
 
 def cmd_stop(args):
     name = _require_name(args)
-    r = api_post(f"/api/stop/{name}")
+    r = api_post(f"/api/pm2/stop/{name}")
     print(r.get("error") or f"[{name}] stopped")
     return 0 if r.get("ok") else 1
 
 
 def cmd_restart(args):
     name = _require_name(args)
-    r = api_post(f"/api/restart/{name}")
+    r = api_post(f"/api/pm2/restart/{name}")
     print(r.get("error") or f"[{name}] restarted (PID {r.get('pid')})" if r.get("ok") else r.get("error"))
     return 0 if r.get("ok") else 1
 
 
 def cmd_delete(args):
     name = _require_name(args)
-    r = api_post(f"/api/delete/{name}")
+    r = api_post(f"/api/pm2/delete/{name}")
     print(r.get("error") or f"[{name}] deleted")
     return 0 if r.get("ok") else 1
 
@@ -174,8 +174,7 @@ def cmd_add(args):
             start_with_os = True; i += 1
         else:
             i += 1
-    # 若给的是脚本路径且无参数，直接执行该脚本
-    r = api_post("/api/add", {
+    r = api_post("/api/pm2/add", {
         "name": name, "cmd": target, "cwd": cwd,
         "keep_live": keep_live, "start_with_os": start_with_os,
     })
@@ -197,7 +196,7 @@ def cmd_logs(args):
 def cmd_monit(args):
     try:
         while True:
-            r = api_get("/api/list")
+            r = api_get("/api/pm2/status")
             if r.get("ok"):
                 subprocess.run("clear" if sys.platform != "win32" else "cls", shell=True)
                 print_table(r.get("services", {}))
@@ -206,6 +205,18 @@ def cmd_monit(args):
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def cmd_on(args):
+    r = api_post("/api/pm2/enable")
+    print(r.get("error") or f"tower-pm2 enabled{', started: ' + ','.join(r['started']) if r.get('started') else ''}")
+    return 0 if r.get("ok") else 1
+
+
+def cmd_off(args):
+    r = api_post("/api/pm2/disable")
+    print(r.get("error") or f"tower-pm2 disabled{', stopped: ' + ','.join(r['stopped']) if r.get('stopped') else ''}")
+    return 0 if r.get("ok") else 1
 
 
 def cmd_ping(args):
@@ -222,16 +233,15 @@ def main():
         print(__doc__)
         return 0
     cmd, args = sys.argv[1], sys.argv[2:]
-    if cmd == "--json":
-        cmd_list._json = True
-        cmd, args = (args + ["list"])[0], (args + ["list"])[1:]
 
     handlers = {
         "list": cmd_list, "status": cmd_list, "ls": cmd_list, "ps": cmd_list,
         "jlist": cmd_list,
         "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
         "delete": cmd_delete, "remove": cmd_delete, "rm": cmd_delete, "del": cmd_delete,
-        "add": cmd_add, "logs": cmd_logs, "monit": cmd_monit, "ping": cmd_ping,
+        "add": cmd_add, "logs": cmd_logs, "monit": cmd_monit,
+        "on": cmd_on, "off": cmd_off,
+        "ping": cmd_ping,
         "-h": lambda a: (print(__doc__), 0)[1],
         "--help": lambda a: (print(__doc__), 0)[1],
     }

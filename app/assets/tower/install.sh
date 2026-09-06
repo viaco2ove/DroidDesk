@@ -42,16 +42,6 @@ else
 {
   "services": [
     {
-      "name": "toonflow-game",
-      "cmd": "NODE_ENV=local node /opt/toonflow/toonflow-game-app/build/app.js",
-      "cwd": "/opt/toonflow/toonflow-game-app",
-      "stdout_log": "/var/log/tower/toonflow-game.out.log",
-      "stderr_log": "/var/log/tower/toonflow-game.err.log",
-      "keep_live": true,
-      "start_with_os": false,
-      "start_nginx_with_ubuntu": false
-    },
-    {
       "name": "nginx",
       "cmd": "nginx",
       "cwd": "/",

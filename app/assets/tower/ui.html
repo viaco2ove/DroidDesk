@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DroidDesk Tower</title>
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--txt:#333;--sub:#8a94a6;--bd:#e6eaf0;--pri:#20a0ff;--ok:#27c93f;--warn:#ffbd2e;--err:#ff5f56;--orange:#e95420}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--txt);font-size:14px}
+.header{background:linear-gradient(135deg,#243447,#2c3e50);color:#fff;padding:14px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.header h1{font-size:18px;font-weight:600;letter-spacing:.5px}
+.header .badge{background:var(--orange);padding:2px 10px;border-radius:10px;font-size:12px}
+.sysbar{display:flex;gap:18px;margin-left:auto;font-size:12px;opacity:.9;flex-wrap:wrap}
+.sysbar b{color:#7fd0ff;font-weight:600}
+.wrap{max-width:1080px;margin:16px auto;padding:0 16px;display:grid;gap:16px}
+.card{background:var(--card);border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.06);overflow:hidden}
+.card>.hd{padding:12px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.card>.hd h2{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+.card>.hd .sp{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.card>.bd{padding:16px 18px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+.dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot.off{background:#c3cbd6}
+.sw{position:relative;display:inline-block;width:44px;height:24px}
+.sw input{opacity:0;width:0;height:0}
+.sl{position:absolute;cursor:pointer;inset:0;background:#c3cbd6;border-radius:24px;transition:.25s}
+.sl:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.25s}
+input:checked+.sl{background:var(--pri)}
+input:checked+.sl:before{transform:translateX(20px)}
+.btn{padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;background:#eef1f5;color:#444}
+.btn:hover{background:#e2e7ee}
+.btn-pri{background:var(--pri);color:#fff}
+.btn-ok{background:var(--ok);color:#fff}
+.btn-err{background:var(--err);color:#fff}
+.btn-sm{padding:4px 10px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:12px;color:var(--sub)}
+.field input{padding:7px 10px;border:1px solid var(--bd);border-radius:5px;font-size:13px;min-width:130px}
+.field input:focus{outline:none;border-color:var(--pri)}
+.formrow{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+table{width:100%;border-collapse:collapse}
+th{background:#f8fafc;padding:9px 12px;text-align:left;font-size:12px;color:var(--sub);border-bottom:1px solid var(--bd);white-space:nowrap}
+td{padding:9px 12px;font-size:13px;border-bottom:1px solid #f2f5f8;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafcfe}
+.empty{text-align:center;color:var(--sub);padding:26px}
+#toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);padding:10px 22px;border-radius:6px;color:#fff;font-size:13px;display:none;z-index:99;box-shadow:0 4px 14px rgba(0,0,0,.2)}
+#toast.ok{background:#27c93f}#toast.err{background:#ff5f56}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90;align-items:center;justify-content:center}
+#modal.show{display:flex}
+.mbox{background:#fff;border-radius:10px;padding:22px;width:430px;max-width:92vw}
+.mbox h3{font-size:15px;margin-bottom:14px}
+.mbox .field{margin-bottom:12px}
+.mbox .field input{width:100%}
+.mfoot{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.chk{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;margin:8px 0}
+.chk label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.sec-desc{font-size:12px;color:var(--sub);margin-top:2px}
+@media(max-width:640px){.sysbar{display:none}.field input{min-width:100px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>DroidDesk Tower</h1><span class="badge">安全高效的服务器运维面板</span>
+  <div class="sysbar" id="sysbar"></div>
+</div>
+
+<div class="wrap">
+
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="ssh-dot"></span>Open-Server (SSH)</h2>
+    <div class="sp">
+      <span id="ssh-port-badge" style="font-size:12px;color:var(--sub)"></span>
+      <label class="sw"><input type="checkbox" id="ssh-sw" onchange="sshToggle(this.checked)"><span class="sl"></span></label>
+    </div>
+  </div>
+  <div class="bd">
+    <div class="sec-desc">sshd will run as long as Ubuntu is running</div>
+    <div style="height:12px"></div>
+    <div class="formrow">
+      <div class="field"><label>Username</label><input id="ssh-user" value="root"></div>
+      <div class="field"><label>Password</label><input id="ssh-pass" type="password" placeholder="********"></div>
+      <div class="field"><label>SSH Port</label><input id="ssh-port" value="8122" style="width:90px"></div>
+      <button class="btn btn-pri" onclick="sshSave()">Save</button>
+    </div>
+    <div class="sec-desc" style="margin-top:8px">Credentials + SSH port applied inside Ubuntu on save</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="ng-dot"></span>Nginx</h2>
+    <div class="sp">
+      <button class="btn btn-sm" onclick="ngAct('nginx-restart')">Restart</button>
+      <label class="sw"><input type="checkbox" id="ng-sw" onchange="ngAct(this.checked?'nginx-start':'nginx-stop')"><span class="sl"></span></label>
+    </div>
+  </div>
+  <div class="bd"><div class="sec-desc">Nginx Web 服务器 - 反向代理 / 静态站点</div></div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="sv-dot"></span>Service</h2>
+    <div class="sp"><button class="btn btn-pri btn-sm" onclick="showAdd('svc')">+ 添加服务</button></div>
+  </div>
+  <div class="bd" style="padding:0;overflow-x:auto">
+    <table>
+      <thead><tr><th>name</th><th>path</th><th>start nginx</th><th>keep live</th><th>status</th><th style="text-align:right">funs</th></tr></thead>
+      <tbody id="svc-body"><tr><td colspan="6" class="empty">loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2><span class="dot" id="pm2-dot"></span>Tower PM2</h2>
+    <div class="sp">
+      <button class="btn btn-sm" onclick="showAdd('pm2')">+ 添加服务</button>
+      <button class="btn btn-sm" onclick="pm2Restart()">Restart</button>
+      <label class="sw"><input type="checkbox" id="pm2-sw" onchange="pm2Toggle(this.checked)"><span class="sl"></span></label>
+    </div>
+  </div>
+  <div class="bd">
+    <div class="sec-desc">解决 pm2 多 pid 混乱的问题 - 单例守护，多入口看到的进程列表完全一致</div>
+    <div style="height:12px"></div>
+    <table>
+      <thead><tr><th>id</th><th>name</th><th>mode</th><th>&#8635;</th><th>status</th><th>cpu</th><th>memory</th><th style="text-align:right">funs</th></tr></thead>
+      <tbody id="pm2-body"><tr><td colspan="8" class="empty">loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+</div>
+
+<div id="toast"></div>
+
+<div id="modal"><div class="mbox">
+  <h3 id="modal-title">添加服务</h3>
+  <div class="field"><label>name（服务名）</label><input id="m-name" placeholder="如 xxx 管理页"></div>
+  <div class="field"><label>path（启动脚本/命令）</label><input id="m-path" placeholder="/opt/xxx/panel/start-panel.sh"></div>
+  <div class="chk">
+    <label><input type="checkbox" id="m-nginx"> start nginx with Ubuntu</label>
+    <label><input type="checkbox" id="m-keep" checked> keep live</label>
+  </div>
+  <div class="mfoot">
+    <button class="btn" onclick="hideAdd()">取消</button>
+    <button class="btn btn-pri" onclick="doAdd()">添加</button>
+  </div>
+</div></div>
+
+<script>
+let toastTimer=null;
+let addTarget='svc';
+function toast(msg,ok=true){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.className=ok?'ok':'err'; el.style.display='block';
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.style.display='none',2600);
+}
+async function api(path,method='GET',body=null){
+  try{
+    const opt={method,headers:{'Content-Type':'application/json'}};
+    if(body)opt.body=JSON.stringify(body);
+    const r=await fetch(path,opt);
+    return await r.json();
+  }catch(e){return{ok:false,error:String(e)}}
+}
+async function refresh(){
+  const[ssh,ng,svc,pm2st,sys]=await Promise.all([
+    api('/api/ssh/status'),api('/api/nginx/status'),
+    api('/api/list'),api('/api/pm2/status'),api('/api/system')
+  ]);
+  document.getElementById('ssh-sw').checked=!!ssh.running;
+  document.getElementById('ssh-port').value=ssh.port||8122;
+  setDot('ssh-dot',ssh.running);
+  document.getElementById('ssh-port-badge').textContent='port '+(ssh.port||8122);
+  document.getElementById('ng-sw').checked=!!ng.running;
+  setDot('ng-dot',ng.running);
+  renderSvc(svc.services||{});
+  renderPm2(pm2st.services||{});
+  document.getElementById('pm2-sw').checked=!!pm2st.enabled;
+  setDot('pm2-dot',!!pm2st.enabled);
+  if(sys.ok){
+    document.getElementById('sysbar').innerHTML=
+      '<span>load <b>'+(sys.loadavg[0]||0).toFixed(1)+'</b></span>'+
+      '<span>mem <b>'+sys.mem_pct+'%</b></span>'+
+      '<span>disk <b>'+Math.round(sys.disk_used_gb)+'/'+Math.round(sys.disk_total_gb)+'GB</b></span>'+
+      '<span>up <b>'+sys.uptime+'</b></span>';
+  }
+}
+function setDot(id,on){const el=document.getElementById(id);el.className='dot '+(on?'on':'off')}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function renderSvc(svc){
+  const tb=document.getElementById('svc-body');
+  const names=Object.keys(svc);
+  if(!names.length){tb.innerHTML='<tr><td colspan="6" class="empty">暂无服务，点击右上角 + 添加</td></tr>';return}
+  tb.innerHTML=names.map(function(n){
+    const s=svc[n];
+    const on=s.status==='online';
+    return '<tr>'+
+      '<td><b>'+esc(n)+'</b></td>'+
+      '<td style="color:var(--sub);max-width:260px;overflow:hidden;text-overflow:ellipsis">'+esc(s.cmd||'')+'</td>'+
+      '<td>'+(s.start_nginx_with_ubuntu?'yes':'-')+'</td>'+
+      '<td>'+(s.keep_live?'yes':'-')+'</td>'+
+      '<td><span class="dot '+(on?'on':'off')+'"></span>'+esc(s.status)+'</td>'+
+      '<td style="text-align:right">'+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="svcAct(\\''+esc(n)+'\\',\\''+(on?'stop':'start')+'\\')">'+(on?'stop':'start')+'</button>'+
+        '<button class="btn btn-sm" onclick="svcAct(\\''+esc(n)+'\\',\\'restart\\')">restart</button>'+
+        '<button class="btn btn-sm btn-err" onclick="svcDel(\\''+esc(n)+'\\')">delete</button>'+
+      '</td></tr>';
+  }).join('');
+}
+function renderPm2(svc){
+  const tb=document.getElementById('pm2-body');
+  const names=Object.keys(svc).sort();
+  if(!names.length){tb.innerHTML='<tr><td colspan="8" class="empty">无受管进程，点击右上角 + 添加</td></tr>';return}
+  tb.innerHTML=names.map(function(n,i){
+    const s=svc[n];
+    const on=s.status==='online';
+    return '<tr>'+
+      '<td>'+i+'</td><td><b>'+esc(n)+'</b></td><td>fork</td><td>'+(s.restart_count||0)+'</td>'+
+      '<td><span class="dot '+(on?'on':'off')+'"></span>'+(on?'online':esc(s.status))+'</td>'+
+      '<td>'+(s.cpu||0)+'%</td><td>'+esc(s.mem||'-')+'</td>'+
+      '<td style="text-align:right">'+
+        '<button class="btn btn-sm" onclick="pm2Act(\\''+esc(n)+'\\',\\'restart\\')">&#8635;</button>'+
+        '<button class="btn btn-sm '+(on?'':'btn-ok')+'" onclick="pm2Act(\\''+esc(n)+'\\',\\''+(on?'stop':'start')+'\\')">'+(on?'&#9632;':'&#9654;')+'</button>'+
+        '<button class="btn btn-sm btn-err" onclick="pm2Del(\\''+esc(n)+'\\')">&#10005;</button>'+
+      '</td></tr>';
+  }).join('');
+}
+async function sshToggle(on){
+  const r=await api('/api/'+(on?'ssh-start':'ssh-stop'),'POST');
+  toast(r.ok?(on?'sshd started':'sshd stopped'):r.error,r.ok);
+  refresh();
+}
+async function sshSave(){
+  const r=await api('/api/ssh-set-cred','POST',{
+    user:document.getElementById('ssh-user').value,
+    password:document.getElementById('ssh-pass').value,
+    port:document.getElementById('ssh-port').value
+  });
+  document.getElementById('ssh-pass').value='';
+  toast(r.ok?(r.message||'saved'):r.error,r.ok);
+  refresh();
+}
+async function ngAct(act){
+  const r=await api('/api/'+act,'POST');
+  toast(r.ok?(r.message||'done'):r.error,r.ok);
+  refresh();
+}
+async function svcAct(name,act){
+  const r=await api('/api/'+act+'/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' '+act+' ok'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function svcDel(name){
+  if(!confirm('删除服务 '+name+'？进程将被停止并移除注册'))return;
+  const r=await api('/api/delete/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' deleted'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function pm2Act(name,act){
+  const r=await api('/api/pm2/'+act+'/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' '+act+' ok'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function pm2Del(name){
+  if(!confirm('从 Tower PM2 删除 '+name+'？进程将被停止并移除'))return;
+  const r=await api('/api/pm2/delete/'+encodeURIComponent(name),'POST');
+  toast(r.ok?(name+' deleted'):r.error,r.ok);
+  setTimeout(refresh,600);
+}
+async function pm2Toggle(on){
+  const r=await api('/api/pm2/'+(on?'enable':'disable'),'POST');
+  toast(r.ok?(on?'tower-pm2 已开启':'tower-pm2 已停止（面板不受影响）'):r.error,r.ok);
+  refresh();
+}
+async function pm2Restart(){
+  const r=await api('/api/pm2/restart-daemon','POST');
+  toast(r.ok?'tower-pm2 已重启':r.error,r.ok);
+  refresh();
+}
+function showAdd(target){addTarget=target;
+  document.getElementById('modal-title').textContent=target==='pm2'?'添加服务到 Tower PM2':'添加服务到 Service';
+  document.getElementById('modal').classList.add('show');
+}
+function hideAdd(){document.getElementById('modal').classList.remove('show')}
+async function doAdd(){
+  const name=document.getElementById('m-name').value.trim();
+  const path=document.getElementById('m-path').value.trim();
+  if(!name||!path){toast('name 和 path 必填',false);return}
+  const payload={
+    name,path,
+    keep_live:document.getElementById('m-keep').checked,
+    start_nginx_with_ubuntu:document.getElementById('m-nginx').checked
+  };
+  const r=await api(addTarget==='pm2'?'/api/pm2/add':'/api/add','POST',payload);
+  if(r.ok){hideAdd();toast('已添加 '+name);setTimeout(refresh,600)}
+  else toast(r.error,false);
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>
