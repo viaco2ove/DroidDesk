@@ -28,7 +28,14 @@ import time
 import subprocess
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 from pathlib import Path
+
+# proot/Android 环境下 locale 常为 C/POSIX，stdio 默认 ASCII，
+# 打印含中文的服务名/错误信息会直接 UnicodeEncodeError 崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 API = "http://127.0.0.1:7088"
 LOG_DIR = "/var/log/tower"
@@ -131,28 +138,28 @@ def _require_name(args):
 
 def cmd_start(args):
     name = _require_name(args)
-    r = api_post(f"/api/pm2/start/{name}")
+    r = api_post(f"/api/pm2/start/{quote(name)}")
     print(r.get("error") or f"[{name}] started (PID {r.get('pid')})" if r.get("ok") else r.get("error"))
     return 0 if r.get("ok") else 1
 
 
 def cmd_stop(args):
     name = _require_name(args)
-    r = api_post(f"/api/pm2/stop/{name}")
+    r = api_post(f"/api/pm2/stop/{quote(name)}")
     print(r.get("error") or f"[{name}] stopped")
     return 0 if r.get("ok") else 1
 
 
 def cmd_restart(args):
     name = _require_name(args)
-    r = api_post(f"/api/pm2/restart/{name}")
+    r = api_post(f"/api/pm2/restart/{quote(name)}")
     print(r.get("error") or f"[{name}] restarted (PID {r.get('pid')})" if r.get("ok") else r.get("error"))
     return 0 if r.get("ok") else 1
 
 
 def cmd_delete(args):
     name = _require_name(args)
-    r = api_post(f"/api/pm2/delete/{name}")
+    r = api_post(f"/api/pm2/delete/{quote(name)}")
     print(r.get("error") or f"[{name}] deleted")
     return 0 if r.get("ok") else 1
 

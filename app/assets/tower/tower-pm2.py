@@ -26,7 +26,7 @@ import threading
 import psutil
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from datetime import datetime
 
 SVC_CONFIG     = "/etc/tower/services.json"
@@ -692,11 +692,11 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         parts = [p for p in path.split("/") if p]
         act = parts[1] if len(parts) > 1 else ""
-        name = parts[2] if len(parts) > 2 else ""
+        name = unquote(parts[2]) if len(parts) > 2 else ""
 
         if act == "pm2":
             sub = name
-            target = parts[3] if len(parts) > 3 else ""
+            target = unquote(parts[3]) if len(parts) > 3 else ""
             handlers = {
                 "status": lambda: {"ok": True, "enabled": pm2_enabled(), "services": dict(REG_PM2.state)},
                 "enable": pm2_enable,
