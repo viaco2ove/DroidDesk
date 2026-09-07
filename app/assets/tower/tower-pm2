@@ -16,6 +16,7 @@ TCP 通信保证 pid 一致性：无论从哪个 proot 实例执行，结果一�
   tower-pm2 restart <name>              重启服务
   tower-pm2 delete <name>               删除服务（停止并移除注册）
   tower-pm2 add <name> <cmd> [选项]      添加服务
+  tower-pm2 flush <name>                清空服务日志
   tower-pm2 logs <name> [lines]         查看服务日志
   tower-pm2 monit                       实时监控（2s 刷新，Ctrl+C 退出）
   tower-pm2 on | off                    启用/停用 Tower PM2 模块
@@ -200,6 +201,22 @@ def cmd_logs(args):
     return 0
 
 
+def cmd_flush(args):
+    name = _require_name(args)
+    flushed = []
+    for suffix in (".out.log", ".err.log"):
+        p = Path(LOG_DIR) / f"{name}{suffix}"
+        if p.exists():
+            with open(p, "w") as f:
+                f.truncate(0)
+            flushed.append(p.name)
+    if flushed:
+        print(f"[{name}] flushed: {', '.join(flushed)}")
+    else:
+        print(f"[{name}] no log files found in {LOG_DIR}")
+    return 0
+
+
 def cmd_monit(args):
     try:
         while True:
@@ -246,7 +263,7 @@ def main():
         "jlist": cmd_list,
         "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
         "delete": cmd_delete, "remove": cmd_delete, "rm": cmd_delete, "del": cmd_delete,
-        "add": cmd_add, "logs": cmd_logs, "monit": cmd_monit,
+        "add": cmd_add, "logs": cmd_logs, "flush": cmd_flush, "monit": cmd_monit,
         "on": cmd_on, "off": cmd_off,
         "ping": cmd_ping,
         "-h": lambda a: (print(__doc__), 0)[1],
