@@ -505,6 +505,88 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                // ── Termux SSH (non-proot, 直接在 bootstrap 内跑 sshd) ──
+
+                "isTermuxSshInstalled" -> {
+                    result.success(linuxRuntime.isTermuxSshInstalled())
+                }
+
+                "isTermuxSshConfigured" -> {
+                    result.success(linuxRuntime.isTermuxSshConfigured())
+                }
+
+                "installTermuxSsh" -> {
+                    thread {
+                        val progressSink: (Double, String) -> Unit = { progress, status ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onInstallProgress",
+                                        mapOf("progress" to progress, "status" to status))
+                            }
+                        }
+                        val ok = linuxRuntime.installTermuxSsh(progressSink)
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "uninstallTermuxSsh" -> {
+                    thread {
+                        val ok = linuxRuntime.uninstallTermuxSsh()
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "getTermuxSshdStatus" -> {
+                    val status = mapOf(
+                        "installed" to linuxRuntime.isTermuxSshInstalled(),
+                        "configured" to linuxRuntime.isTermuxSshConfigured(),
+                        "running" to linuxRuntime.isTermuxSshdRunning(),
+                        "port" to getTermuxSshPortFromPrefs(),
+                        "username" to linuxRuntime.getTermuxSshUsername(),
+                        "passwordSet" to linuxRuntime.isTermuxSshPasswordSet(),
+                    )
+                    Log.d(TAG, "getTermuxSshdStatus: $status")
+                    result.success(status)
+                }
+
+                "startTermuxSshd" -> {
+                    // sshd 必须在前台 service 持有下才能在后台存活
+                    if (linuxRuntime.isBootstrapped()) startForegroundService()
+                    thread {
+                        val ok = linuxRuntime.startTermuxSshd()
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "stopTermuxSshd" -> {
+                    thread {
+                        linuxRuntime.stopTermuxSshd()
+                        runOnUiThread { result.success(true) }
+                    }
+                }
+
+                "setTermuxSshPassword" -> {
+                    val password = call.argument<String>("password") ?: ""
+                    thread {
+                        val ok = linuxRuntime.setTermuxSshPassword(password)
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "clearTermuxSshPassword" -> {
+                    thread {
+                        val ok = linuxRuntime.clearTermuxSshPassword()
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
+                "configureTermuxSsh" -> {
+                    thread {
+                        val ok = linuxRuntime.configureTermuxSsh()
+                        runOnUiThread { result.success(ok) }
+                    }
+                }
+
                 "getUbuntuStatus" -> {
                     val ubuntuRunning = if (chrootRuntime.hasRoot()) {
                         chrootRuntime.isChrootRunning()
@@ -657,6 +739,7 @@ class MainActivity : FlutterActivity() {
 
                 // ── Native Terminal ──
                 "launchNativeTerminal" -> {
+                    linuxRuntime.extractBootstrapIfNeeded(applicationContext)
                     val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.terminal.NativeTerminalActivity::class.java)
                     startActivity(intent)
                     result.success(true)
@@ -896,6 +979,11 @@ class MainActivity : FlutterActivity() {
     private fun getSshPortFromPrefs(): Int {
         val sp = getSharedPreferences("ubuntu_console", Context.MODE_PRIVATE)
         return sp.getString("port", "22")?.toIntOrNull() ?: 22
+    }
+
+    private fun getTermuxSshPortFromPrefs(): Int {
+        val sp = getSharedPreferences("termux_ssh", Context.MODE_PRIVATE)
+        return sp.getString("port", "8022")?.toIntOrNull() ?: 8022
     }
 
     private fun applyUbuntuCredentials(user: String, password: String, port: String) {

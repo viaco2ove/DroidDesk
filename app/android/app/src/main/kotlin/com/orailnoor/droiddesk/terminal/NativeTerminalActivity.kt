@@ -192,6 +192,8 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
         val cwd: String
         var shellArgs: Array<String?> = arrayOfNulls(0)
 
+        val droidDeskBash = java.io.File(filesDir, "usr/bin/bash").absolutePath
+
         when {
             envTag == "ubuntu" && chroot.hasRoot() && chroot.isRootfsReady() -> {
                 shellPath = "chroot ${chroot.getRootfsPath()} /bin/bash --login"
@@ -214,11 +216,18 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
                 shellPath = "chroot ${chroot.getRootfsPath()} /bin/bash --login"
                 cwd = "/"
             }
-            chroot.hasRoot() -> {
-                shellPath = "/system/bin/sh"
-                cwd = "/"
+            // Native Terminal entry on a non-root, bootstrapped device:
+            // launch the DroidDesk-bootstrap bash as a login shell so pkg/apt/passwd
+            // and the rest of the Termux-ported toolchain are reachable on PATH. Falls
+            // back to /system/bin/sh if the bootstrap has not been extracted yet.
+            java.io.File(droidDeskBash).canExecute() -> {
+                shellPath = droidDeskBash
+                shellArgs = arrayOf(droidDeskBash, "--login")
+                cwd = java.io.File(filesDir, "home").absolutePath
+                Log.i(TAG, "Native Terminal using DroidDesk bootstrap shell: $droidDeskBash")
             }
             else -> {
+                Log.w(TAG, "DroidDesk bootstrap not extracted yet ($droidDeskBash missing)")
                 shellPath = "/system/bin/sh"
                 cwd = "/"
             }
@@ -239,11 +248,26 @@ class NativeTerminalActivity : Activity(), TerminalSessionClient, TerminalViewCl
     }
 
     private fun getEnvironment(): Array<String> {
+        val prefix = "/data/data/$packageName/files/usr"
         val env = mutableListOf(
             "TERM=xterm-256color",
             "HOME=/data/data/$packageName/files/home",
-            "PATH=/system/bin:/system/xbin",
-            "LANG=en_US.UTF-8"
+            "PREFIX=$prefix",
+            "PATH=$prefix/bin:$prefix/bin/applets:/system/bin:/system/xbin",
+            "LANG=en_US.UTF-8",
+            // Termux-ported ELFs may lack (or carry stale) DT_RUNPATH entries after
+            // relocation, so the dynamic linker cannot find libandroid-support.so
+            // and friends without an explicit search path — bash dies instantly
+            // otherwise ("CANNOT LINK EXECUTABLE ... libandroid-support.so").
+            "LD_LIBRARY_PATH=$prefix/lib",
+            // Redirect the many hardcoded /data/data/com.termux/... paths baked
+            // into Termux binaries (apt, dpkg, pkg, ...) to our own prefix.
+            "LD_PRELOAD=$prefix/lib/libsocket_hook.so",
+            "TMPDIR=/data/data/$packageName/files/tmp",
+            "SHELL=$prefix/bin/bash",
+            "ANDROID_ROOT=/system",
+            "ANDROID_DATA=/data",
+            "BOOTCLASSPATH=" + (System.getProperty("java.boot.class.path") ?: "")
         )
         if (chroot.hasRoot() && chroot.isRootfsReady()) {
             env.add("USER=root")

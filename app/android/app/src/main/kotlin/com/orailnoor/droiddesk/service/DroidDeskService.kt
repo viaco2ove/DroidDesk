@@ -97,6 +97,12 @@ class DroidDeskService : Service() {
                         Log.i(TAG, "Daemon active, starting sshd...")
                         runtime.startUbuntuSshd()
                     }
+                    if (sp.getBoolean("sshWithTermux", false) &&
+                        runtime.isTermuxSshInstalled() &&
+                        !runtime.isTermuxSshdRunning()) {
+                        Log.i(TAG, "Daemon active, starting Termux sshd...")
+                        runtime.startTermuxSshd()
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to restore Ubuntu session: ${e.message}")
                 }

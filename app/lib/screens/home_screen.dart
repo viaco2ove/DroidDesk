@@ -202,6 +202,11 @@ class HomeScreen extends StatelessWidget {
                         },
                       ),
 
+                      const SizedBox(height: 10),
+
+                      // ── Termux SSH (non-proot, runs in Termux bootstrap) ──
+                      _TermuxSshdCard(),
+
                       // ── Ubuntu Status (real-time) ──
                       if (state.optionalApps['ubuntu_install'] == true) ...[
                         const SizedBox(height: 10),
@@ -709,6 +714,343 @@ class _TerminalSheetState extends State<_TerminalSheet> {
   }
 }
 
+// ── Termux SSH Widget ──
+
+class _TermuxSshdCard extends StatefulWidget {
+  @override
+  State<_TermuxSshdCard> createState() => _TermuxSshdCardState();
+}
+
+class _TermuxSshdCardState extends State<_TermuxSshdCard> {
+  bool _installed = false;
+  bool _configured = false;
+  bool _running = false;
+  int _port = 8022;
+  String _username = 'u0_a0';
+  bool _passwordSet = false;
+  bool _loading = true;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _loading = true);
+    try {
+      final s = await DroidDeskPlatform.getTermuxSshdStatus();
+      if (mounted) {
+        setState(() {
+          _installed = s['installed'] as bool? ?? false;
+          _configured = s['configured'] as bool? ?? false;
+          _running = s['running'] as bool? ?? false;
+          _port = s['port'] as int? ?? 8022;
+          _username = s['username']?.toString() ?? _username;
+          _passwordSet = s['passwordSet'] as bool? ?? false;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _snack(String msg, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: error ? DroidTheme.error : DroidTheme.accent,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  Future<void> _onInstall() async {
+    setState(() => _busy = true);
+    try {
+      final ok = await DroidDeskPlatform.installTermuxSsh(
+        onProgress: (p, status) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(status),
+                duration: const Duration(milliseconds: 1500),
+              ),
+            );
+          }
+        },
+      );
+      _snack(ok ? 'openssh installed' : 'install failed', error: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  Future<void> _onConfigure() async {
+    setState(() => _busy = true);
+    try {
+      final ok = await DroidDeskPlatform.configureTermuxSsh();
+      _snack(ok ? 'sshd configured (port $_port)' : 'configure failed', error: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  Future<void> _onStart() async {
+    setState(() => _busy = true);
+    try {
+      final ok = await DroidDeskPlatform.startTermuxSshd();
+      _snack(ok ? 'sshd started on port $_port' : 'start failed', error: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  Future<void> _onStop() async {
+    setState(() => _busy = true);
+    try {
+      await DroidDeskPlatform.stopTermuxSshd();
+      _snack('sshd stopped');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  Future<void> _onSetPassword() async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _PasswordDialog(initialUsername: _username),
+    );
+    if (result == null || result.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final ok = await DroidDeskPlatform.setTermuxSshPassword(result);
+      _snack(ok ? 'password set for $_username' : 'set password failed', error: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  Future<void> _onClearPassword() async {
+    setState(() => _busy = true);
+    try {
+      final ok = await DroidDeskPlatform.clearTermuxSshPassword();
+      _snack(ok ? 'password cleared for $_username' : 'clear failed', error: !ok);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refresh();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: _refresh,
+      child: Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFF002D2A), Color(0xFF00483F)],
+          ),
+          borderRadius: BorderRadius.circular(DroidTheme.radiusMd),
+          border: Border.all(color: const Color(0xFF00BFA5).withValues(alpha: 0.3)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.lock_outline_rounded, color: Color(0xFF00BFA5), size: 20),
+                const SizedBox(width: 8),
+                Text('Termux SSH', style: DroidTheme.headingSm),
+                const Spacer(),
+                if (_loading)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00BFA5)),
+                  )
+                else
+                  Icon(Icons.refresh_rounded, color: DroidTheme.textDim, size: 18),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _statusRow(_installed, 'sshd binary + host keys'),
+            const SizedBox(height: 6),
+            _statusRow(_configured, 'home /data/user/0/com.orailnoor.droiddesk/files/home'),
+            const SizedBox(height: 6),
+            _statusRow(_configured, 'sshd_config patched'),
+            const SizedBox(height: 6),
+            Row(children: [
+              _dot(_running),
+              const SizedBox(width: 8),
+              Text('OpenSSH', style: DroidTheme.bodySm),
+              const Spacer(),
+              Text(
+                _running ? 'running (port $_port)' : 'stopped',
+                style: DroidTheme.bodySm.copyWith(
+                  color: _running ? DroidTheme.accent : DroidTheme.textDim,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ]),
+            if (_running) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: DroidTheme.accent.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: DroidTheme.accent.withValues(alpha: 0.2)),
+                ),
+                child: Text(
+                  'ssh -p $_port <device-ip>',
+                  style: DroidTheme.monoSm.copyWith(color: DroidTheme.accent, fontSize: 11),
+                ),
+              ),
+            ],
+            if (_configured) ...[
+              const SizedBox(height: 10),
+              _infoRow('User', _username),
+              const SizedBox(height: 4),
+              _infoRow(
+                'Password',
+                _passwordSet ? 'set (use sshpass or passwd)' : 'not set — SSH login will fail',
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _busy ? null : _onSetPassword,
+                      icon: const Icon(Icons.key_rounded, size: 16),
+                      label: Text(_passwordSet ? 'Change password' : 'Set password'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFF00BFA5),
+                        side: BorderSide(color: const Color(0xFF00BFA5).withValues(alpha: 0.5)),
+                      ),
+                    ),
+                  ),
+                  if (_passwordSet) ...[
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _busy ? null : _onClearPassword,
+                        icon: const Icon(Icons.lock_open_rounded, size: 16),
+                        label: const Text('Clear'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: DroidTheme.textDim,
+                          side: BorderSide(color: DroidTheme.textDim.withValues(alpha: 0.3)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                if (!_installed)
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _busy ? null : _onInstall,
+                      icon: const Icon(Icons.download_rounded, size: 16),
+                      label: const Text('Install openssh'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00BFA5),
+                        foregroundColor: Colors.black,
+                      ),
+                    ),
+                  )
+                else if (!_configured)
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _busy ? null : _onConfigure,
+                      icon: const Icon(Icons.settings_rounded, size: 16),
+                      label: Text('Configure (port $_port)'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00BFA5),
+                        foregroundColor: Colors.black,
+                      ),
+                    ),
+                  )
+                else if (_running)
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _busy ? null : _onStop,
+                      icon: const Icon(Icons.stop_circle_outlined, size: 16),
+                      label: const Text('Stop'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DroidTheme.error,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  )
+                else
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _busy ? null : _onStart,
+                      icon: const Icon(Icons.play_arrow_rounded, size: 16),
+                      label: const Text('Start'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DroidTheme.accent,
+                        foregroundColor: Colors.black,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _dot(bool on) => Container(
+        width: 8,
+        height: 8,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: on ? DroidTheme.accent : DroidTheme.textDim,
+          boxShadow: on ? [BoxShadow(color: DroidTheme.accent.withValues(alpha: 0.5), blurRadius: 4)] : null,
+        ),
+      );
+
+  Widget _infoRow(String label, String value) {
+    return Row(children: [
+      Text(label, style: DroidTheme.bodySm.copyWith(color: DroidTheme.textDim)),
+      const Spacer(),
+      Flexible(
+        child: Text(
+          value,
+          textAlign: TextAlign.right,
+          style: DroidTheme.monoSm.copyWith(color: DroidTheme.textSecondary),
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+    ]);
+  }
+
+  Widget _statusRow(bool ok, String label) => Row(children: [
+        Icon(
+          ok ? Icons.check_circle_rounded : Icons.radio_button_unchecked,
+          size: 14,
+          color: ok ? DroidTheme.accent : DroidTheme.textDim,
+        ),
+        const SizedBox(width: 8),
+        Text(label, style: DroidTheme.bodySm),
+      ]);
+}
+
 // ── Ubuntu Status Widget ──
 
 class _UbuntuStatusCard extends StatefulWidget {
@@ -897,6 +1239,100 @@ class _ActionCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ── Termux SSH Set Password Dialog ──
+
+class _PasswordDialog extends StatefulWidget {
+  final String initialUsername;
+  const _PasswordDialog({required this.initialUsername});
+  @override
+  State<_PasswordDialog> createState() => _PasswordDialogState();
+}
+
+class _PasswordDialogState extends State<_PasswordDialog> {
+  final _pass1 = TextEditingController();
+  final _pass2 = TextEditingController();
+  bool _showPw = false;
+
+  @override
+  void dispose() {
+    _pass1.dispose();
+    _pass2.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: DroidTheme.cardBg,
+      title: const Text('Set SSH password'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'User: ${widget.initialUsername}',
+            style: DroidTheme.monoSm.copyWith(color: DroidTheme.textSecondary),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Sets the password for this Termux user inside the bootstrap. '
+            'Stored locally — only useful if you have already set up ssh keys '
+            'or use sshpass / interactive login.',
+            style: DroidTheme.bodySm.copyWith(color: DroidTheme.textDim),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _pass1,
+            obscureText: !_showPw,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: 'New password',
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                icon: Icon(_showPw ? Icons.visibility_off : Icons.visibility),
+                onPressed: () => setState(() => _showPw = !_showPw),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _pass2,
+            obscureText: !_showPw,
+            decoration: const InputDecoration(
+              labelText: 'Confirm',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(null),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            if (_pass1.text.isEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('password cannot be empty')),
+              );
+              return;
+            }
+            if (_pass1.text != _pass2.text) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('passwords do not match')),
+              );
+              return;
+            }
+            Navigator.of(context).pop(_pass1.text);
+          },
+          child: const Text('Set'),
+        ),
+      ],
     );
   }
 }

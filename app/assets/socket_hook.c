@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <dirent.h>
 #include <android/log.h>
 
 #ifndef NEW_PREFIX
@@ -20,7 +21,32 @@
 
 static const char *TERMUX_PREFIX = "/data/data/com.termux/files/usr";
 static const char *REL_TERMUX_PREFIX = "data/data/com.termux/files/usr";
+static const char *TERMUX_HOME = "/data/data/com.termux/files/home";
+static const char *REL_TERMUX_HOME = "data/data/com.termux/files/home";
 static const char *REL_TERMUX_BASE = "data/data/com.termux";
+
+/* NEW_PREFIX 去掉结尾 "/usr" = 我们的应用 files 目录（Termux base 的对应物），
+ * 以及其中的 home 子目录。rewrite_path 需要把
+ *   /data/data/com.termux/files/home/X → files/home/X
+ *   /data/data/com.termux/X            → files/X
+ * 注意 home 绝不能落在 usr 下面（libtermux-auth 的 .termux_authinfo 会写错地方）。 */
+static char new_base[512];
+static char new_home[512];
+
+static void compute_base_dirs() {
+    snprintf(new_base, sizeof(new_base), "%s", NEW_PREFIX);
+    size_t l = strlen(new_base);
+    if (l > 4 && strcmp(new_base + l - 4, "/usr") == 0) new_base[l - 4] = '\0';
+    snprintf(new_home, sizeof(new_home), "%s/home", new_base);
+}
+
+/* 匹配 path 是否以 prefix 开头，且后面紧跟 '/' 或结尾。 */
+static int prefix_match(const char *path, const char *prefix) {
+    size_t l = strlen(prefix);
+    if (strncmp(path, prefix, l) != 0) return 0;
+    char next = path[l];
+    return next == '/' || next == '\0';
+}
 
 /* Path-based libc wrappers we need to redirect. */
 static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
@@ -63,6 +89,10 @@ static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
 static int (*real_mknodat)(int, const char *, mode_t, dev_t) = NULL;
 static int (*real_mkfifo)(const char *, mode_t) = NULL;
 static int (*real_mkfifoat)(int, const char *, mode_t) = NULL;
+static DIR *(*real_opendir)(const char *) = NULL;
+static DIR *(*real_fdopendir)(int) = NULL;
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execvp)(const char *, char *const[]) = NULL;
 static void *(*real_dlopen)(const char *, int) = NULL;
 
 static volatile int hook_initialized = 0;
@@ -115,6 +145,10 @@ static void do_init() {
     real_mknodat = dlsym(RTLD_NEXT, "mknodat");
     real_mkfifo = dlsym(RTLD_NEXT, "mkfifo");
     real_mkfifoat = dlsym(RTLD_NEXT, "mkfifoat");
+    real_opendir = dlsym(RTLD_NEXT, "opendir");
+    real_fdopendir = dlsym(RTLD_NEXT, "fdopendir");
+    real_execve = dlsym(RTLD_NEXT, "execve");
+    real_execvp = dlsym(RTLD_NEXT, "execvp");
     real_dlopen = dlsym(RTLD_NEXT, "dlopen");
     __sync_synchronize();
     hook_initialized = 1;
@@ -140,39 +174,36 @@ static const char* strip_dot_slash(const char *path) {
 static const char* rewrite_path(const char* path, char* buf, size_t buf_size) {
     if (!path) return path;
 
-    const char *p = strip_dot_slash(path);
+    if (!new_base[0]) compute_base_dirs();
 
-    size_t rel_len = strlen(REL_TERMUX_PREFIX);
-    if (strncmp(p, REL_TERMUX_PREFIX, rel_len) == 0) {
-        char next = p[rel_len];
-        if (next == '/' || next == '\0') {
-            snprintf(buf, buf_size, "%s%s", NEW_PREFIX, p + rel_len);
-            return buf;
-        }
+    /* 最长匹配优先：home 和 usr 前缀都比 base 长，必须先判断。 */
+    if (prefix_match(path, TERMUX_PREFIX)) {
+        snprintf(buf, buf_size, "%s%s", NEW_PREFIX, path + strlen(TERMUX_PREFIX));
+        return buf;
     }
-
-    size_t base_len = strlen(REL_TERMUX_BASE);
-    if (strncmp(p, REL_TERMUX_BASE, base_len) == 0) {
-        char next = p[base_len];
-        if (next == '/' || next == '\0') {
-            snprintf(buf, buf_size, "%s", NEW_PREFIX);
-            return buf;
-        }
-    }
-
-    size_t term_len = strlen(TERMUX_PREFIX);
-    if (strncmp(path, TERMUX_PREFIX, term_len) == 0) {
-        snprintf(buf, buf_size, "%s%s", NEW_PREFIX, path + term_len);
+    if (prefix_match(path, TERMUX_HOME)) {
+        snprintf(buf, buf_size, "%s%s", new_home, path + strlen(TERMUX_HOME));
         return buf;
     }
 
-    size_t abs_base_len = strlen("/data/data/com.termux");
-    if (strncmp(path, "/data/data/com.termux", abs_base_len) == 0) {
-        char next = path[abs_base_len];
-        if (next == '/' || next == '\0') {
-            snprintf(buf, buf_size, "%s", NEW_PREFIX);
-            return buf;
-        }
+    const char *p = strip_dot_slash(path);
+    if (prefix_match(p, REL_TERMUX_PREFIX)) {
+        snprintf(buf, buf_size, "%s%s", NEW_PREFIX, p + strlen(REL_TERMUX_PREFIX));
+        return buf;
+    }
+    if (prefix_match(p, REL_TERMUX_HOME)) {
+        snprintf(buf, buf_size, "%s%s", new_home, p + strlen(REL_TERMUX_HOME));
+        return buf;
+    }
+    if (prefix_match(p, REL_TERMUX_BASE)) {
+        /* data/data/com.termux/<suffix> → files/<suffix>（保留子路径） */
+        snprintf(buf, buf_size, "%s%s", new_base, p + strlen(REL_TERMUX_BASE));
+        return buf;
+    }
+    if (prefix_match(path, "/data/data/com.termux")) {
+        /* /data/data/com.termux/<suffix> → files/<suffix>（保留子路径） */
+        snprintf(buf, buf_size, "%s%s", new_base, path + strlen("/data/data/com.termux"));
+        return buf;
     }
 
     const char *tmpdir = getenv("TMPDIR");
@@ -315,6 +346,41 @@ FILE *fopen64(const char *pathname, const char *mode) {
     char buf[1024];
     if (real_fopen64) return real_fopen64(rewrite_path(pathname, buf, sizeof(buf)), mode);
     return real_fopen(rewrite_path(pathname, buf, sizeof(buf)), mode);
+}
+
+/* apt enumerates its config/state directories (e.g. .../etc/apt/apt.conf.d)
+ * via opendir(), which is not covered by the open/stat family above. */
+DIR *opendir(const char *pathname) {
+    setup();
+    char buf[1024];
+    return real_opendir(rewrite_path(pathname, buf, sizeof(buf)));
+}
+
+DIR *fdopendir(int fd) {
+    setup();
+    return real_fdopendir(fd);
+}
+
+/* Termux binaries hardcode /data/data/com.termux/... in argv[0] for exec*() calls
+ * (notably sshd's sshd-session child). Rewrite the path the same way we rewrite
+ * file open() arguments so the spawn succeeds inside DroidDesk's sandbox. */
+static int exec_real(const char *path, char *const argv[], char *const envp[],
+                     int (*fn)(const char *, char *const[], char *const[])) {
+    char buf[1024];
+    const char *new_path = rewrite_path(path, buf, sizeof(buf));
+    return fn(new_path, argv, envp);
+}
+
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    setup();
+    return exec_real(pathname, argv, envp, real_execve);
+}
+
+int execvp(const char *file, char *const argv[]) {
+    setup();
+    char buf[1024];
+    const char *new_file = rewrite_path(file, buf, sizeof(buf));
+    return real_execvp(new_file, argv);
 }
 
 int stat64(const char *pathname, struct stat64 *statbuf) {

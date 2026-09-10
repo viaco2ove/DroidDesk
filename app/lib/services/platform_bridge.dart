@@ -196,6 +196,71 @@ class DroidDeskPlatform {
     return await _channel.invokeMethod<bool>('uninstallUbuntuSsh') ?? false;
   }
 
+  // ── Termux SSH (在 Termux bootstrap 内直接跑 sshd，不走 proot) ──
+
+  static Future<bool> isTermuxSshInstalled() async {
+    final r = await _channel.invokeMethod<bool>('isTermuxSshInstalled');
+    return r ?? false;
+  }
+
+  static Future<bool> isTermuxSshConfigured() async {
+    final r = await _channel.invokeMethod<bool>('isTermuxSshConfigured');
+    return r ?? false;
+  }
+
+  static Future<bool> installTermuxSsh({
+    void Function(double progress, String status)? onProgress,
+  }) async {
+    onInstallProgress = onProgress;
+    final r = await _channel.invokeMethod<bool>('installTermuxSsh');
+    onInstallProgress = null;
+    return r ?? false;
+  }
+
+  static Future<bool> uninstallTermuxSsh() async {
+    final r = await _channel.invokeMethod<bool>('uninstallTermuxSsh');
+    return r ?? false;
+  }
+
+  static Future<bool> configureTermuxSsh() async {
+    final r = await _channel.invokeMethod<bool>('configureTermuxSsh');
+    return r ?? false;
+  }
+
+  /// Termux sshd 状态：{installed, configured, running, port, username, passwordSet}
+  static Future<Map<String, dynamic>> getTermuxSshdStatus() async {
+    final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('getTermuxSshdStatus');
+    final m = raw ?? const {};
+    return {
+      'installed': m['installed'] == true,
+      'configured': m['configured'] == true,
+      'running': m['running'] == true,
+      'port': (m['port'] is num) ? (m['port'] as num).toInt() : 8022,
+      'username': m['username']?.toString() ?? 'u0_a0',
+      'passwordSet': m['passwordSet'] == true,
+    };
+  }
+
+  static Future<bool> startTermuxSshd() async {
+    return await _channel.invokeMethod<bool>('startTermuxSshd') ?? false;
+  }
+
+  static Future<void> stopTermuxSshd() async {
+    await _channel.invokeMethod('stopTermuxSshd');
+  }
+
+  static Future<bool> setTermuxSshPassword(String password) async {
+    final r = await _channel.invokeMethod<bool>('setTermuxSshPassword', {
+      'password': password,
+    });
+    return r ?? false;
+  }
+
+  static Future<bool> clearTermuxSshPassword() async {
+    final r = await _channel.invokeMethod<bool>('clearTermuxSshPassword');
+    return r ?? false;
+  }
+
   /// Ubuntu / OpenSSH 运行时状态查询
   /// 返回值：{ubuntuRunning: bool, sshdRunning: bool, sshPort: int}
   static Future<Map<String, dynamic>> getUbuntuStatus() async {

@@ -78,6 +78,8 @@ class LinuxRuntime(private val context: Context) {
         // 独立的 sshd 长期会话（在 Ubuntu 内部运行 sshd 直到显式 stop）。
         // 与桌面 session 分开，避免争夺 sessionProcess。
         @Volatile private var sshdProcess: Process? = null
+        // 独立的 Termux sshd 长期会话（直接在 Termux bootstrap 内跑 sshd，不走 proot）
+        @Volatile private var termuxSshdProcess: Process? = null
         // supervisor 守护进程长期会话（持有 proot 容器，管理 sshd 等子进程）
         @Volatile private var supervisorProcess: Process? = null
     }
@@ -144,6 +146,7 @@ class LinuxRuntime(private val context: Context) {
         "imagemagick" to (File(binDir, "magick").exists() || File(binDir, "convert").exists()),
         "ubuntu_install" to isProotDistroInstalled("ubuntu"),
         "proot_debian" to isMinimalDebianInstalled(),
+        "termux_ssh" to isTermuxSshInstalled(),
     )
 
     private fun isMinimalDebianInstalled(): Boolean {
@@ -314,6 +317,7 @@ class LinuxRuntime(private val context: Context) {
             wrapDpkgForPath()
             wrapUpdateAlternatives()
             ensureSocketHookPrebuilt()
+            repatchShellInitFiles()
             return
         }
 
@@ -703,6 +707,15 @@ class LinuxRuntime(private val context: Context) {
         Log.i(TAG, "Patching shebangs: $oldPrefix -> $newPrefix")
         var patchCount = 0
 
+        // Extensions recognized as text/config that may contain the Termux prefix.
+        // /etc/profile and /etc/bash.bashrc have no extension and no shebang, so we
+        // also include any plain-text file under etc/ that decodes as text and
+        // contains the Termux prefix.
+        val configExts = setOf(
+            "service", "desktop", "conf", "xml", "pc", "cmake",
+            "la", "prl", "sh", "pl", "py", "rb", "json", "ini",
+        )
+
         val dirsToScan = listOf("bin", "libexec", "share", "etc", "var/lib/dpkg/info")
         for (dirName in dirsToScan) {
             val dir = File(prefixDir, dirName)
@@ -719,11 +732,11 @@ class LinuxRuntime(private val context: Context) {
 
                         val isScript = bytes.size >= 2 &&
                             bytes[0] == '#'.code.toByte() && bytes[1] == '!'.code.toByte()
-                        val isPathConfig = file.extension.lowercase() in setOf(
-                            "service", "desktop", "conf", "xml", "pc", "cmake",
-                            "la", "prl", "sh", "pl", "py", "rb", "json", "ini",
-                        )
-                        if (isScript || isPathConfig) {
+                        val ext = file.extension.lowercase()
+                        val isPathConfig = ext in configExts
+                        val isShellInit = dirName == "etc" &&
+                            (file.name == "profile" || file.name == "bash.bashrc")
+                        if (isScript || isPathConfig || isShellInit) {
                             val content = file.readText()
                             if (content.contains(oldPrefix)) {
                                 val updated = content.replace(oldPrefix, newPrefix)
@@ -739,6 +752,29 @@ class LinuxRuntime(private val context: Context) {
         }
         markerFile.writeText("done")
         Log.i(TAG, "Patched $patchCount scripts.")
+    }
+
+    private fun repatchShellInitFiles() {
+        val oldPrefix = "/data/data/com.termux/files/usr"
+        val newPrefix = prefixDir.absolutePath
+        if (oldPrefix == newPrefix) return
+        for (relDir in listOf("etc", "etc/profile.d")) {
+            val dir = File(prefixDir, relDir)
+            if (!dir.exists() || !dir.isDirectory) continue
+            dir.listFiles()?.forEach { file ->
+                if (!file.isFile || !file.canRead()) return@forEach
+                val n = file.name
+                val ok = n == "profile" || n == "bash.bashrc" || n.endsWith(".sh") ||
+                    n.endsWith(".bashrc") || n.endsWith(".profile") || n.endsWith(".bash") ||
+                    n.endsWith(".zsh") || n.endsWith(".zshrc")
+                if (!ok) return@forEach
+                try {
+                    val c = file.readText()
+                    if (c.contains(oldPrefix)) file.writeText(c.replace(oldPrefix, newPrefix))
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
     /** Relocate commands that Xfce compiled as absolute Termux paths. */
@@ -1090,6 +1126,10 @@ class LinuxRuntime(private val context: Context) {
         ).joinToString(":")
         env["GDK_PIXBUF_MODULEDIR"] = "${prefixDir.absolutePath}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
         env["GDK_PIXBUF_MODULE_FILE"] = "${prefixDir.absolutePath}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+        // 把写死的 /data/data/com.termux/... 路径重写到本 app 的 prefix。
+        // libtermux-auth（passwd/sshd 密码校验）等库内部硬编码 termux 路径，
+        // 没有 hook 时会把文件写到无法访问的旧路径上。
+        env["LD_PRELOAD"] = "${prefixDir.absolutePath}/lib/libsocket_hook.so"
 
         // Mesa is always available. Adreno devices use Turnip + Zink for hardware
         // rendering; other GPUs use Mesa's software renderer instead of being
@@ -1685,6 +1725,531 @@ class LinuxRuntime(private val context: Context) {
     }
 
     fun isUbuntuSshdManaged(): Boolean = sshdProcess?.isAlive == true
+
+    // ══════════════════════════════════════════════════════════════
+    // Termux sshd (直接在 Termux bootstrap 内运行 sshd，不走 proot)
+    // ══════════════════════════════════════════════════════════════
+
+    private val termuxSshSharedPrefs: android.content.SharedPreferences
+        get() = context.getSharedPreferences("termux_ssh", android.content.Context.MODE_PRIVATE)
+
+    private fun getTermuxSshPort(): Int =
+        termuxSshSharedPrefs.getString("port", "8022")?.toIntOrNull() ?: 8022
+
+    /**
+     * sshd 用 getpwuid() 解析登录用户名。Termux 把 Android app uid 100000+u 转成
+     * u0_a<u%100000>（如 uid 100476 -> u0_a476），getpwuid 在 Termux 移植的 libc
+     * 里也是这么算的。直接在这里套同一规则，保证 UI 显示的名字就是 sshd 认的名字。
+     */
+    fun getTermuxSshUsername(): String {
+        val uid = try {
+            java.io.File("/proc/self/status").useLines { lines ->
+                lines.firstOrNull { it.startsWith("Uid:") }
+                    ?.trim()
+                    ?.split(Regex("\\s+"))
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+            }
+        } catch (_: Exception) { null } ?: android.os.Process.myUid()
+        return "u0_a${uid % 100000}"
+    }
+
+    /**
+     * 检查当前 ssh 用户的密码是否已设置。
+     * Termux 用 ~/.termux_authinfo 而不是 /etc/shadow 来存密码 hash。
+     * 文件内容是 libtermux-auth 生成的 20 字节原始 SHA-1
+     * （PBKDF2-HMAC-SHA1，salt "Termux!"，65536 轮）——没有 username 前缀。
+     */
+    fun isTermuxSshPasswordSet(): Boolean {
+        val authinfo = File(homeDir, ".termux_authinfo")
+        return try {
+            authinfo.length() >= 20L
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 通过 libtermux-auth.so 的 termux_change_passwd() C API 设置密码。
+     *
+     * libtermux-auth 内部把 .termux_authinfo 写到硬编码的 /data/data/com.termux/...
+     * 路径，路径重写依赖 socket_hook 的 LD_PRELOAD 符号拦截。app 进程自身没有
+     * LD_PRELOAD，所以不能在 app 进程内直接调（JNI 方案试过，函数返回 0 但文件
+     * 写到了 inaccessible 的 termux 路径上）。因此用 bootstrap clang 现场编译一个
+     * 小 helper，通过 executeCommand（子进程带 LD_PRELOAD=libsocket_hook.so）跑它。
+     */
+    fun setTermuxSshPassword(newPassword: String): Boolean {
+        if (newPassword.isEmpty()) return false
+        ensureTermuxAccountFiles()
+        val helper = ensureTermuxAuthHelper()
+        if (helper == null) {
+            Log.e(TAG, "setTermuxSshPassword: helper build failed")
+            return false
+        }
+        return try {
+            val out = executeCommand("'${helper.absolutePath}' '$newPassword'")
+            val ok = !out.startsWith("Error:") && isTermuxSshPasswordSet()
+            Log.i(TAG, "setTermuxSshPassword: helper ok=$ok out=${out.take(200)}")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "setTermuxSshPassword failed", e)
+            false
+        }
+    }
+
+    /**
+     * 编译（或复用已编译的）termux-auth helper。helper 用 dlopen 加载
+     * libtermux-auth.so 并调用 termux_change_passwd(argv[1])。
+     * 返回 helper 可执行文件路径，失败返回 null。
+     */
+    private fun ensureTermuxAuthHelper(): File? {
+        val helper = File(tmpDir, "termux-auth-helper")
+        val helperC = File(tmpDir, "termux-auth-helper.c")
+        val soPath = File(prefixDir, "lib/libtermux-auth.so").absolutePath
+        if (!File(soPath).exists()) return null
+        if (helper.canExecute()) return helper
+
+        helperC.writeText(
+            """
+            #include <stdbool.h>
+            #include <dlfcn.h>
+            #include <stdio.h>
+            int main(int argc, char** argv) {
+                if (argc < 2) { fprintf(stderr, "usage: %s <password>\n", argv[0]); return 2; }
+                void* h = dlopen("$soPath", RTLD_NOW | RTLD_LOCAL);
+                if (!h) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 3; }
+                bool (*change)(const char*) = (bool (*)(const char*)) dlsym(h, "termux_change_passwd");
+                if (!change) { fprintf(stderr, "dlsym failed: %s\n", dlerror()); return 4; }
+                /* termux_change_passwd 返回 bool：1=成功，0=失败。 */
+                int rc = change(argv[1]) ? 0 : 1;
+                fprintf(stderr, "termux_change_passwd ok=%d\n", rc == 0);
+                return rc;
+            }
+            """.trimIndent()
+        )
+
+        val clang = File(prefixDir, "bin/clang")
+        if (!clang.exists()) {
+            Log.w(TAG, "clang not found, cannot build termux-auth-helper")
+            return null
+        }
+        val compileCmd = listOf(
+            clang.absolutePath,
+            helperC.absolutePath,
+            "-o", helper.absolutePath,
+            "-ldl"
+        )
+        return try {
+            val pb = ProcessBuilder(compileCmd)
+                .redirectErrorStream(true)
+                .also {
+                    it.environment().clear()
+                    it.environment()["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
+                    it.environment()["PATH"] = "${prefixDir.absolutePath}/bin:/system/bin"
+                    it.environment()["TMPDIR"] = tmpDir.absolutePath
+                }
+            val process = pb.start()
+            val log = process.inputStream.bufferedReader().readText()
+            val exitCode = process.waitFor()
+            if (exitCode != 0) {
+                Log.e(TAG, "termux-auth-helper compile failed ($exitCode): ${log.take(300)}")
+                return null
+            }
+            helper.setExecutable(true, false)
+            Log.i(TAG, "termux-auth-helper built at ${helper.absolutePath}")
+            helper
+        } catch (e: Exception) {
+            Log.e(TAG, "termux-auth-helper build error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Termux bootstrap 不带 etc/passwd 和 etc/shadow，但 passwd 二进制必须能找到它们。
+     * 第一次设置密码前用最小骨架初始化两个文件。uid/gid 用当前进程的 uid。
+     */
+    private fun ensureTermuxAccountFiles() {
+        val etc = File(prefixDir, "etc")
+        val passwdFile = File(etc, "passwd")
+        val shadowFile = File(etc, "shadow")
+        val groupFile = File(etc, "group")
+        val uid = try {
+            java.io.File("/proc/self/status").useLines { lines ->
+                lines.firstOrNull { it.startsWith("Uid:") }
+                    ?.trim()?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
+            }
+        } catch (_: Exception) { null } ?: android.os.Process.myUid()
+        val user = "u0_a${uid % 100000}"
+        if (!passwdFile.exists()) {
+            // root 的 home 也指到我们的 files/home：sshd 登录 root 时 chdir 到
+            // passwd 里的 home，指到 /root 会落空（目录不存在）。
+            passwdFile.writeText(
+                "root:x:0:0:root:/data/data/${context.packageName}/files/home:/system/bin/sh\n" +
+                "$user:x:$uid:$uid:DroidDesk user:/data/data/${context.packageName}/files/home:/system/bin/sh\n"
+            )
+            passwdFile.setReadable(true, false)
+        }
+        if (!groupFile.exists()) {
+            groupFile.writeText(
+                "root:x:0:\n" +
+                "$user:x:$uid:\n"
+            )
+            groupFile.setReadable(true, false)
+        }
+        if (!shadowFile.exists()) {
+            shadowFile.writeText(
+                "root:*:19000:0:99999:7:::\n" +
+                "$user:*:19000:0:99999:7:::\n"
+            )
+            shadowFile.setReadable(true, false)
+            shadowFile.setWritable(true, false)
+        }
+    }
+
+    /**
+     * 用 libtermux-auth.so 的 termux_remove_passwd() API 清除密码（删 .termux_authinfo）。
+     * 与 setTermuxSshPassword 相同，必须经过带 socket_hook 的子进程。
+     */
+    fun clearTermuxSshPassword(): Boolean {
+        val helper = ensureTermuxAuthHelper() ?: return false
+        return try {
+            val removeHelperC = File(tmpDir, "termux-auth-remove.c")
+            val removeHelper = File(tmpDir, "termux-auth-remove")
+            val soPath = File(prefixDir, "lib/libtermux-auth.so").absolutePath
+            if (removeHelper.canExecute()) {
+                executeCommand("'${removeHelper.absolutePath}'")
+                return !isTermuxSshPasswordSet()
+            }
+            if (!removeHelperC.exists()) {
+                removeHelperC.writeText(
+                    """
+                    #include <stdbool.h>
+                    #include <dlfcn.h>
+                    #include <stdio.h>
+                    int main(void) {
+                        void* h = dlopen("$soPath", RTLD_NOW | RTLD_LOCAL);
+                        if (!h) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 3; }
+                        bool (*rm)(void) = (bool (*)(void)) dlsym(h, "termux_remove_passwd");
+                        if (!rm) { fprintf(stderr, "dlsym failed: %s\n", dlerror()); return 4; }
+                        /* termux_remove_passwd 返回 bool：1=成功（含 ENOENT）。 */
+                        int rc = rm() ? 0 : 1;
+                        fprintf(stderr, "termux_remove_passwd ok=%d\n", rc == 0);
+                        return rc;
+                    }
+                    """.trimIndent()
+                )
+            }
+            val clang = File(prefixDir, "bin/clang")
+            if (!clang.exists()) return false
+            val pb = ProcessBuilder(listOf(
+                clang.absolutePath,
+                removeHelperC.absolutePath,
+                "-o", removeHelper.absolutePath,
+                "-ldl"
+            )).redirectErrorStream(true)
+                .also {
+                    it.environment().clear()
+                    it.environment()["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
+                    it.environment()["PATH"] = "${prefixDir.absolutePath}/bin:/system/bin"
+                    it.environment()["TMPDIR"] = tmpDir.absolutePath
+                }
+            val p = pb.start()
+            val log = p.inputStream.bufferedReader().readText()
+            if (p.waitFor() != 0) {
+                Log.e(TAG, "termux-auth-remove compile failed: ${log.take(300)}")
+                return false
+            }
+            removeHelper.setExecutable(true, false)
+            executeCommand("'${removeHelper.absolutePath}'")
+            val ok = !isTermuxSshPasswordSet()
+            Log.i(TAG, "clearTermuxSshPassword: ok=$ok")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "clearTermuxSshPassword failed", e)
+            false
+        }
+    }
+
+    /** sshd 二进制 + host keys 都在 bootstrap 里即可视为"已安装"。 */
+    fun isTermuxSshInstalled(): Boolean {
+        return File(prefixDir, "bin/sshd").exists() &&
+            File(prefixDir, "etc/ssh/ssh_host_ed25519_key").exists()
+    }
+
+    /**
+     * sshd_config 是否已经被我们的脚本打过补丁（含 Port 行 + PasswordAuthentication yes +
+     * 至少一个未注释的 HostKey 行指向我们的 prefix）。
+     * 重新安装 Termux bootstrap 会让 marker 丢失，这里直接读 config 内容判断。
+     */
+    fun isTermuxSshConfigured(): Boolean {
+        val cfg = File(prefixDir, "etc/ssh/sshd_config")
+        if (!cfg.exists()) return false
+        return try {
+            val lines = cfg.readLines()
+            val hasPort = lines.any { it.trim().startsWith("Port ") }
+            val hasPwYes = lines.any {
+                val t = it.trim()
+                t.startsWith("PasswordAuthentication yes")
+            }
+            val sshDir = File(prefixDir, "etc/ssh").absolutePath
+            val hasHostKey = lines.any {
+                val t = it.trim()
+                t.startsWith("HostKey ") && t.contains(sshDir)
+            }
+            val hasUserEnv = lines.any {
+                it.trim().startsWith("PermitUserEnvironment yes")
+            }
+            hasPort && hasPwYes && hasHostKey && hasUserEnv
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 把 Port / PasswordAuthentication / HostKey 写入 sshd_config，并 mkdir /run/sshd。
+     * 幂等：每次启动都重写一次，确保所有路径都对。
+     * 不调 sed：Kotlin raw string + shell 转义容易出错，直接读 + 改 + 写更稳。
+     *
+     * 备份策略：首次 configure 时把原始 sshd_config 拷到 sshd_config.orig，
+     * 后续 configure 从 orig 重新派生。这样即使前几轮写入把多行 HostKey
+     * 折叠成同一个文件名，也能从原始 4 个不同 key 恢复正确映射。
+     */
+    fun configureTermuxSsh(): Boolean {
+        if (!isTermuxSshInstalled()) return false
+        val port = getTermuxSshPort()
+        val cfg = File(prefixDir, "etc/ssh/sshd_config")
+        val origCfg = File(prefixDir, "etc/ssh/sshd_config.orig")
+        val sshDir = File(prefixDir, "etc/ssh").absolutePath
+        val pidFile = File(prefixDir, "var/run/sshd.pid").apply { parentFile?.mkdirs() }
+        return try {
+            // 第一次配置时备份原始文件
+            if (!origCfg.exists() && cfg.exists()) {
+                cfg.copyTo(origCfg, overwrite = false)
+            }
+            // 总是从 orig 重新生成，避免旧补丁污染
+            val source = if (origCfg.exists()) origCfg else cfg
+            val raw = if (source.exists()) source.readText() else ""
+            val lines = raw.lines()
+            val out = lines.map { line ->
+                val trimmed = line.trim()
+                val keyMatch = Regex("^#?\\s*(HostKey|Port|PasswordAuthentication|PermitRootLogin|PidFile|PermitUserEnvironment)\\b(.*)$").matchEntire(trimmed)
+                if (keyMatch != null) {
+                    val key = keyMatch.groupValues[1]
+                    val rest = keyMatch.groupValues[2].trim()
+                    when (key) {
+                        "HostKey" -> {
+                            val fileName = rest.substringAfterLast('/')
+                            when (fileName) {
+                                "ssh_host_rsa_key" -> "HostKey $sshDir/ssh_host_rsa_key"
+                                "ssh_host_ecdsa_key" -> "HostKey $sshDir/ssh_host_ecdsa_key"
+                                "ssh_host_ed25519_key" -> "HostKey $sshDir/ssh_host_ed25519_key"
+                                "ssh_host_mldsa44_ed25519_key" -> "HostKey $sshDir/ssh_host_mldsa44_ed25519_key"
+                                else -> "HostKey $sshDir/$fileName"
+                            }
+                        }
+                        "Port" -> "Port $port"
+                        "PasswordAuthentication" -> "PasswordAuthentication yes"
+                        "PermitRootLogin" -> "PermitRootLogin prohibit-password"
+                        "PidFile" -> "PidFile ${pidFile.absolutePath}"
+                        // 让会话从 ~/.ssh/environment 拿到 LD_LIBRARY_PATH / LD_PRELOAD，
+                        // 否则登录 shell 起不来（找不到 libandroid-support.so）。
+                        "PermitUserEnvironment" -> "PermitUserEnvironment yes"
+                        else -> line
+                    }
+                } else line
+            }
+            // orig 里可能没有这些键（如 PermitUserEnvironment），转换为改写不到，直接补上
+            val present = out.map { it.trim().substringBefore(' ').trimEnd() }.toSet()
+            val needed = listOf(
+                "PermitRootLogin prohibit-password",
+                "PasswordAuthentication yes",
+                "PermitUserEnvironment yes",
+                "Port $port"
+            )
+            val appended = needed.filter { it.substringBefore(' ') !in present }
+            cfg.writeText((out + appended).joinToString("\n"))
+            // sshd 需要 /run/sshd 存在（兼容 SELinux，直接在 prefix 下建）
+            java.io.File("$sshDir/../run/sshd").mkdirs()
+            // 会话环境：sshd 给登录 shell 的 env 不含 LD_LIBRARY_PATH/LD_PRELOAD，
+            // bash 链接 libandroid-support.so 会直接失败。PermitUserEnvironment yes
+            // 配合 ~/.ssh/environment 把这两个变量注入每个会话。
+            val userSshDir = File(homeDir, ".ssh")
+            if (!userSshDir.exists()) userSshDir.mkdirs()
+            File(userSshDir, "environment").writeText(
+                "LD_LIBRARY_PATH=${prefixDir.absolutePath}/lib\n" +
+                "LD_PRELOAD=${prefixDir.absolutePath}/lib/libsocket_hook.so\n" +
+                "PREFIX=${prefixDir.absolutePath}\n" +
+                "TMPDIR=${tmpDir.absolutePath}\n" +
+                "TERMUX_APP__PACKAGE_NAME=${context.packageName}\n"
+            )
+            Log.i(TAG, "Termux sshd configured (port=$port)")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "configureTermuxSsh failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 通过 apt-get install 安装 openssh。bootstrap 内的 apt 走 socket_hook 重写路径，
+     * 直接调 executeCommand 即可，不需要 proot 包装。
+     */
+    fun installTermuxSsh(
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        if (!isBootstrapped()) return false
+        onProgress?.invoke(0.1, "Updating package lists...")
+        if (executeCommand("apt-get update").startsWith("Error:")) {
+            onProgress?.invoke(-1.0, "apt-get update failed")
+            return false
+        }
+        onProgress?.invoke(0.5, "Installing openssh...")
+        if (executeCommand("apt-get install -y --no-install-recommends openssh")
+                .startsWith("Error:")) {
+            onProgress?.invoke(-1.0, "apt-get install failed")
+            return false
+        }
+        onProgress?.invoke(0.9, "Configuring sshd...")
+        if (!configureTermuxSsh()) {
+            onProgress?.invoke(-1.0, "sshd_config patch failed")
+            return false
+        }
+        onProgress?.invoke(1.0, "openssh installed")
+        return true
+    }
+
+    fun uninstallTermuxSsh(): Boolean {
+        if (!isBootstrapped()) return false
+        return try {
+            // 先停掉可能正在跑的 sshd
+            stopTermuxSshd()
+            executeCommand("apt-get purge -y openssh || true")
+            executeCommand("apt-get autoremove -y || true")
+            Log.i(TAG, "Termux openssh purged")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "uninstallTermuxSsh failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 通过 /proc/net/tcp + TCP 探测判断 Termux sshd 是否监听。
+     * 复用与 Ubuntu sshd 相同的 TCP 探测模式（Android SELinux 沙箱读不到其它进程的 cmdline）。
+     */
+    fun isTermuxSshdRunning(): Boolean {
+        if (!isTermuxSshInstalled()) return false
+        if (termuxSshdProcess?.isAlive == true) return true
+        return try {
+            val port = getTermuxSshPort()
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val resultHolder = booleanArrayOf(false)
+            val errorHolder = arrayOfNulls<String>(1)
+            java.util.concurrent.Executors.newSingleThreadExecutor().execute {
+                try {
+                    java.net.Socket().use { sock ->
+                        sock.connect(java.net.InetSocketAddress("127.0.0.1", port), 500)
+                        resultHolder[0] = true
+                    }
+                } catch (e: Exception) {
+                    errorHolder[0] = e.javaClass.simpleName + ": " + (e.message ?: "null")
+                } finally {
+                    latch.countDown()
+                }
+            }
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+            val found = resultHolder[0]
+            Log.d(TAG, "isTermuxSshdRunning (TCP probe): found=$found port=$port err=${errorHolder[0]}")
+            found
+        } catch (e: Exception) {
+            Log.w(TAG, "isTermuxSshdRunning failed: ${e.javaClass.simpleName} ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 直接在 Termux bootstrap 内启动 sshd。env 必须设 LD_LIBRARY_PATH 和
+     * LD_PRELOAD=libsocket_hook.so，否则 sshd 找不到 libcrypto 等动态库，
+     * 并且会读 com.termux 旧路径。
+     */
+    fun startTermuxSshd(): Boolean {
+        if (!isTermuxSshInstalled()) {
+            Log.w(TAG, "startTermuxSshd: sshd not installed")
+            return false
+        }
+        if (!isTermuxSshConfigured()) {
+            if (!configureTermuxSsh()) {
+                Log.w(TAG, "startTermuxSshd: configure failed")
+                return false
+            }
+        }
+        if (termuxSshdProcess?.isAlive == true) {
+            Log.i(TAG, "startTermuxSshd: already running")
+            return true
+        }
+        // 清理任何游离的 sshd 子进程（之前崩溃或被系统 kill 留下的）
+        stopTermuxSshd()
+        return try {
+            val sshdBin = File(prefixDir, "bin/sshd").absolutePath
+            val fullCmd = "exec $sshdBin -D -e"
+            Log.i(TAG, "startTermuxSshd: $fullCmd")
+            termuxSshdProcess = ProcessBuilder("sh", "-c", fullCmd)
+                .redirectErrorStream(true)
+                .apply {
+                    environment().apply {
+                        put("PREFIX", prefixDir.absolutePath)
+                        put("PATH", "${prefixDir.absolutePath}/bin:/system/bin")
+                        put("TMPDIR", tmpDir.absolutePath)
+                        put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+                        put("LD_PRELOAD", "${prefixDir.absolutePath}/lib/libsocket_hook.so")
+                        put("HOME", homeDir.absolutePath)
+                        put("SHELL", File(binDir, "bash").absolutePath)
+                        put("TERMUX_APP__PACKAGE_NAME", context.packageName)
+                        put("TERMUX_APP__DATA_DIR", baseDir.absolutePath)
+                        put("TERMUX__PREFIX", prefixDir.absolutePath)
+                        put("TERMUX__HOME", homeDir.absolutePath)
+                    }
+                }
+                .start()
+            Thread {
+                try {
+                    termuxSshdProcess!!.inputStream.bufferedReader().forEachLine { line ->
+                        Log.i(TAG, "termux-sshd: $line")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "termux-sshd stdout reader: ${e.message}")
+                }
+            }.start()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startTermuxSshd failed", e)
+            termuxSshdProcess = null
+            false
+        }
+    }
+
+    fun stopTermuxSshd() {
+        // OpenSSH 的 -D 模式在收到首个连接后会 fork 出 sshd-session 子进程，
+        // listener 进程的 PID 会被替换为新进程。我们启动时持有的 PID 很快就过时了，
+        // 所以必须 pkill 整个 sshd 进程组，不能只 kill 单个 PID。
+        val sshdPattern = "${prefixDir.absolutePath}/bin/sshd"
+        try {
+            executeCommand("pkill -f '$sshdPattern' || true")
+            // 兜底：再 wait 一会儿
+            executeCommand("pkill -9 -f '$sshdPattern' || true")
+        } catch (_: Exception) {
+        }
+        // 原生 process 句柄也清掉
+        termuxSshdProcess?.let { p ->
+            try {
+                if (p.isAlive) p.destroyForcibly()
+            } catch (_: Exception) {
+            }
+        }
+        termuxSshdProcess = null
+    }
+
+    fun isTermuxSshdManaged(): Boolean = termuxSshdProcess?.isAlive == true
 
     // ── pm2 daemon (Node.js process manager) ──
     //
