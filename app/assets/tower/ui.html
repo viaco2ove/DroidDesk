@@ -206,6 +206,8 @@ function renderSvc(svc){
       '<td style="text-align:right">'+
         '<button class="btn btn-sm '+(on?'':'btn-ok')+'" data-action="'+act+'" data-name="'+dn+'">'+(on?'stop':'start')+'</button> '+
         '<button class="btn btn-sm" data-action="restart" data-name="'+dn+'">restart</button> '+
+        '<button class="btn btn-sm btn-warn" data-action="disabled" data-name="'+dn+'">disable</button> '+
+        '<button class="btn btn-sm btn-ok" data-action="enabled" data-name="'+dn+'">enable</button> '+
         '<button class="btn btn-sm btn-err" data-del="'+dn+'">delete</button>'+
       '</td></tr>';
   }).join('');

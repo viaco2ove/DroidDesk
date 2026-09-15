@@ -251,6 +251,7 @@ def start_service(reg: Registry, name: str) -> dict:
     os.makedirs(os.path.dirname(log_out), exist_ok=True)
 
     reg.user_stopped.discard(name)
+    _unmark_disabled(name)   # start 自动清掉 disabled 标记
 
     try:
         log.info("[%s] starting: %s  cmd=%s", reg.label, name, cmd)
@@ -274,62 +275,75 @@ def start_service(reg: Registry, name: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def stop_service(reg: Registry, name: str, force: bool = False) -> dict:
+def stop_service(reg: Registry, name: str, force: bool = False, persistent: bool = True) -> dict:
+    """停止一个服务。
+
+    persistent=True（默认）：kill 后立即写 disabled 标记，watchdog 不再拉起。
+    persistent=False：仅 kill 一次，下一个 watchdog 周期可能被 keep_live 自动重启。
+    """
     reg.user_stopped.add(name)
     with services_lock:
         reg.state[name] = {**reg.state.get(name, {}), "status": "stopped", "pid": None}
 
-    victims = set()
     pid = read_pid(name)
-    if pid and pid_exists(pid):
-        victims.add(pid)
-        victims.update(_find_children(pid))
-    victims.update(_match_pids(reg, name))
-
-    if not victims:
+    if not pid or not pid_exists(pid):
         clear_pid(name)
         with services_lock:
             reg.state.pop(name, None)
+        if persistent:
+            _mark_disabled(name)
         return {"ok": True, "message": "not running"}
 
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    log.info("[%s] stopping: %s force=%s pids=%s", reg.label, name, force, sorted(victims))
-    for v in victims:
+    # 服务是用 start_new_session=True 启动的，pidfile 里是 session-leader 的 pid。
+    # 用 killpg 杀掉整个进程组（leader + 所有子进程），不留残留。
+    log.info("[%s] stopping: %s (pid=%d, session, persistent=%s)", reg.label, name, pid, persistent)
+    killed = False
+    for sig in ([signal.SIGTERM, signal.SIGKILL] if not force else [signal.SIGKILL]):
         try:
-            os.kill(v, sig)
-        except Exception:
-            pass
-
-    deadline = time.time() + 6
-    while time.time() < deadline:
-        if not any(pid_exists(v) for v in victims):
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, sig)
+            killed = True
+        except ProcessLookupError:
+            # 进程已经死了
             break
-        time.sleep(0.5)
-
-    victims.update(_match_pids(reg, name))
-    for v in list(victims):
-        if pid_exists(v):
-            try:
-                os.kill(v, signal.SIGKILL)
-            except Exception:
-                pass
-            try:
-                os.killpg(os.getpgid(v), signal.SIGKILL)
-            except Exception:
-                pass
-
-    for _ in range(3):
-        time.sleep(1)
-        for v in _match_pids(reg, name):
-            try:
-                os.kill(v, signal.SIGKILL)
-            except Exception:
-                pass
+        except Exception as e:
+            log.warning("[%s] killpg(%d, %s) failed: %s", reg.label, pid, sig, e)
+        if killed:
+            time.sleep(0.5)
+            if not pid_exists(pid):
+                break
 
     clear_pid(name)
     with services_lock:
         reg.state.pop(name, None)
+    if persistent:
+        _mark_disabled(name)
     return {"ok": True, "message": "stopped"}
+
+
+def _mark_disabled(name: str) -> None:
+    """把服务标记为 disabled（watchdog 不会自动重启）。"""
+    Path(_DISABLED_FLAG).parent.mkdir(parents=True, exist_ok=True)
+    disabled_list = []
+    if Path(_DISABLED_FLAG).exists():
+        disabled_list = [l for l in Path(_DISABLED_FLAG).read_text().splitlines() if l]
+    if name not in disabled_list:
+        disabled_list.append(name)
+        Path(_DISABLED_FLAG).write_text("\n".join(disabled_list))
+
+
+def _unmark_disabled(name: str) -> None:
+    """移除服务的 disabled 标记。"""
+    if not Path(_DISABLED_FLAG).exists():
+        return
+    disabled_list = [l for l in Path(_DISABLED_FLAG).read_text().splitlines() if l and l != name]
+    if disabled_list:
+        Path(_DISABLED_FLAG).write_text("\n".join(disabled_list) + "\n")
+    else:
+        try:
+            Path(_DISABLED_FLAG).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def restart_service(reg: Registry, name: str) -> dict:
@@ -451,6 +465,60 @@ def pm2_restart_daemon() -> dict:
     pm2_disable()
     time.sleep(1)
     return pm2_enable()
+
+
+# ── 单服务 disabled / enabled ─────────────────────────────────────────────────
+
+_DISABLED_FLAG = "/run/tower/service.disabled"
+
+
+def _service_disabled(name: str) -> bool:
+    return Path(_DISABLED_FLAG).exists() and name in Path(_DISABLED_FLAG).read_text().splitlines()
+
+
+def _stop_disabled_service(reg: Registry, name: str) -> None:
+    """显式 disable：调用 stop_service 默认即写标记"""
+    stop_service(reg, name, force=True)
+    log.info("[%s] service '%s' marked disabled", reg.label, name)
+
+
+def _enable_disabled_service(reg: Registry, name: str) -> None:
+    """移除 disabled 标记（若 tower-pm2 已开启则尝试拉起服务）"""
+    _unmark_disabled(name)
+    log.info("[%s] service '%s' marked enabled, will auto-start if tower-pm2 enabled", reg.label, name)
+
+
+# ── watchdog 感知 disabled 标记 ────────────────────────────────────────────────
+
+def _watch(reg: Registry, restart_times: dict) -> None:
+    for svc in _svc_list(reg):
+        name = svc.get("name", "")
+        if not svc.get("keep_live", False):
+            continue
+        if name in reg.user_stopped:
+            continue
+        if _service_disabled(name):
+            continue   # 被用户手动 disabled，watchdog 不碰它
+        pid = read_pid(name)
+        if pid and pid_exists(pid):
+            continue
+        now = time.time()
+        times = [t for t in restart_times.get(name, []) if now - t < RESTART_WINDOW]
+        if len(times) >= MAX_RESTARTS:
+            log.warning("[%s] crash_loop detect for %s", reg.label, name)
+            with services_lock:
+                reg.state[name] = {
+                    "pid": None, "status": "crash_loop",
+                    "cpu": 0, "mem": "0MB", "uptime": "",
+                    "restart_count": len(times),
+                    "last_restart": reg.state.get(name, {}).get("last_restart", ""),
+                    "keep_live": True,
+                }
+            continue
+        log.warning("[%s] service %s died, auto-restarting...", reg.label, name)
+        times.append(now)
+        restart_times[name] = times
+        start_service(reg, name)
 
 
 def _read_ssh_port() -> int:
@@ -699,8 +767,8 @@ class Handler(BaseHTTPRequestHandler):
             target = unquote(parts[3]) if len(parts) > 3 else ""
             handlers = {
                 "status": lambda: {"ok": True, "enabled": pm2_enabled(), "services": dict(REG_PM2.state)},
-                "enable": pm2_enable,
-                "disable": pm2_disable,
+                "enable": pm2_enable, "enabled": pm2_enable,
+                "disable": pm2_disable, "disabled": pm2_disable,
                 "restart-daemon": pm2_restart_daemon,
                 "start": lambda: start_service(REG_PM2, target) if target else {"ok": False, "error": "name required"},
                 "stop": lambda: stop_service(REG_PM2, target, force=True) if target else {"ok": False, "error": "name required"},

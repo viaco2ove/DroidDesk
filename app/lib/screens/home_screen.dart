@@ -885,8 +885,17 @@ class _TermuxSshdCardState extends State<_TermuxSshdCard> {
             const SizedBox(height: 12),
             _statusRow(_installed, 'sshd binary + host keys'),
             const SizedBox(height: 6),
-            _statusRow(_configured, 'home /data/user/0/com.orailnoor.droiddesk/files/home'),
-            const SizedBox(height: 6),
+            Row(children: [
+              _dot(_running),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'home /data/user/0/com.orailnoor.droiddesk/files/home',
+                  style: DroidTheme.bodySm,
+                ),
+              ),
+            ]),
+            const SizedBox(height: 12),
             _statusRow(_configured, 'sshd_config patched'),
             const SizedBox(height: 6),
             Row(children: [

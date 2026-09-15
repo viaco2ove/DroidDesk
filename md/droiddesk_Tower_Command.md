@@ -402,24 +402,24 @@ droiddesk-tower service list --json | jq '.[] | "\(.name): \(.status)"'
 
 ## 七、与 UI 的完整对应关系
 
-| CLI 命令 | UI 对应功能 |
-|----------|------------|
-| `droiddesk-tower panel status` | 主面板状态显示 |
-| `droiddesk-tower panel port` | 主面板端口修改输入框 |
-| `droiddesk-tower ssh status/start/stop/restart` | SSH 模块开关按钮 |
-| `droiddesk-tower ssh set-password` | SSH 账号密码输入框 + Save |
-| `droiddesk-tower ssh set-port` | SSH 端口输入框 |
+| CLI 命令                                                 | UI 对应功能 |
+|----------------------------------------------------------|------------|
+| `droiddesk-tower panel status`                           | 主面板状态显示 |
+| `droiddesk-tower panel port`                             | 主面板端口修改输入框 |
+| `droiddesk-tower ssh status/start/stop/restart`          | SSH 模块开关按钮 |
+| `droiddesk-tower ssh set-password`                       | SSH 账号密码输入框 + Save |
+| `droiddesk-tower ssh set-port`                           | SSH 端口输入框 |
 | `droiddesk-tower nginx status/start/stop/restart/reload` | Nginx 模块开关 / restart 按钮 |
-| `droiddesk-tower service list` | 服务列表 |
-| `droiddesk-tower service add` | 服务添加表单 |
-| `droiddesk-tower service delete` | 服务删除按钮 |
-| `droiddesk-tower service start/stop/restart` | 服务操作按钮 |
-| `droiddesk-tower service status` | 服务状态/进程信息 |
-| `droiddesk-tower service logs` | 服务日志查看器 |
-| `tower-pm2 install/start/stop/restart/status` | droiddesk-tower-pm2 模块头部控制按钮 |
-| `tower-pm2 list` | droiddesk-tower-pm2 服务列表表格 |
-| `tower-pm2 add` | "+ 添加服务" 按钮 |
-| `tower-pm2 remove` | 服务列表中的 delete 操作 |
+| `droiddesk-tower service list`                           | 服务列表 |
+| `droiddesk-tower service add`                            | 服务添加表单 |
+| `droiddesk-tower service delete`                         | 服务删除按钮 |
+| `droiddesk-tower service start/stop/restart`             | 服务操作按钮 |
+| `droiddesk-tower service status`                         | 服务状态/进程信息 |
+| `droiddesk-tower service logs`                           | 服务日志查看器 |
+| `tower-pm2 install/start/stop/restart/status/disabled/enabled`           | droiddesk-tower-pm2 模块头部控制按钮 |
+| `tower-pm2 list`                                         | droiddesk-tower-pm2 服务列表表格 |
+| `tower-pm2 add`                                          | "+ 添加服务" 按钮 |
+| `tower-pm2 remove`                                       | 服务列表中的 delete 操作 |
 
 ## 八、目录结构
 
@@ -458,3 +458,16 @@ droiddesk-tower service list --json | jq '.[] | "\(.name): \(.status)"'
 - 守护进程安装/卸载/故障恢复时使用 `droiddesk-tower pm2`
 - 需要实时监控时使用 `tower-pm2 monit`
 - 脚本集成时使用 `--json` 选项
+
+## 更新代码
+代码复制到/opt/droiddesk/tower 还要做什么才有效
+# 1. 复制新文件
+cp tower-pm2.py /opt/droiddesk/tower/tower-pm2.py
+# 2. 重启进程（用进程组 kill，不留残留）
+kill -9 $(cat /run/tower/tower-pm2.pid)   # 或 pkill -f tower-pm2.py
+
+# 3. 重拉起
+cd /opt/droiddesk/tower && nohup python3 tower-pm2.py --port 7088 >> /var/log/tower/tower-pm2.log 2>&1 &
+
+# 4. 验证
+ps aux | grep tower-pm2 | grep -v grep
